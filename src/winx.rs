@@ -312,7 +312,20 @@ pub fn native_context_menu(hwnd: isize, paths: &[std::path::PathBuf]) -> Result<
             let mut pt = POINT::default();
             GetCursorPos(&mut pt)?;
             let hwnd = HWND(hwnd as *mut _);
+            // Sous-menus dynamiques (« Envoyer vers », « Ouvrir avec », icônes d'extensions) :
+            // Windows les remplit via des messages qu'on doit transmettre à IContextMenu2/3
+            // pendant que le menu est ouvert. On sous-classe la fenêtre le temps du menu.
+            use windows::core::Interface;
+            use windows::Win32::UI::Shell::{IContextMenu2, IContextMenu3, RemoveWindowSubclass, SetWindowSubclass};
+            MENU_HANDLER.with(|h| {
+                *h.borrow_mut() = cm.cast::<IContextMenu3>().map(MenuHandler::V3).or_else(|_| cm.cast::<IContextMenu2>().map(MenuHandler::V2)).ok();
+            });
+            let subclassed = SetWindowSubclass(hwnd, Some(menu_subclass_proc), 0xE4F1, 0).as_bool();
             let cmd = TrackPopupMenuEx(menu, (TPM_RETURNCMD | TPM_RIGHTBUTTON).0, pt.x, pt.y, hwnd, None);
+            if subclassed {
+                let _ = RemoveWindowSubclass(hwnd, Some(menu_subclass_proc), 0xE4F1);
+            }
+            MENU_HANDLER.with(|h| *h.borrow_mut() = None);
             if cmd.0 > 0 {
                 let info = CMINVOKECOMMANDINFO {
                     cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
@@ -331,6 +344,51 @@ pub fn native_context_menu(hwnd: isize, paths: &[std::path::PathBuf]) -> Result<
         }
         result.map_err(|e| e.message().to_string())
     }
+}
+
+#[cfg(windows)]
+enum MenuHandler {
+    V3(windows::Win32::UI::Shell::IContextMenu3),
+    V2(windows::Win32::UI::Shell::IContextMenu2),
+}
+
+#[cfg(windows)]
+thread_local! {
+    static MENU_HANDLER: std::cell::RefCell<Option<MenuHandler>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Transmet au menu Windows les messages qui servent à dessiner et remplir ses sous-menus.
+#[cfg(windows)]
+unsafe extern "system" fn menu_subclass_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    _id: usize,
+    _data: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::UI::Shell::DefSubclassProc;
+    const WM_DRAWITEM: u32 = 0x002B;
+    const WM_MEASUREITEM: u32 = 0x002C;
+    const WM_INITMENUPOPUP: u32 = 0x0117;
+    const WM_MENUCHAR: u32 = 0x0120;
+    if matches!(msg, WM_DRAWITEM | WM_MEASUREITEM | WM_INITMENUPOPUP | WM_MENUCHAR) {
+        let handled = MENU_HANDLER.with(|h| {
+            let mut result = LRESULT(0);
+            let ok = match h.borrow().as_ref() {
+                Some(MenuHandler::V3(c)) => unsafe { c.HandleMenuMsg2(msg, wparam, lparam, Some(&mut result)) }.is_ok(),
+                Some(MenuHandler::V2(c)) => unsafe { c.HandleMenuMsg(msg, wparam, lparam) }.is_ok(),
+                None => false,
+            };
+            ok.then_some(result)
+        });
+        if let Some(r) = handled {
+            // WM_MENUCHAR renvoie une valeur ; les autres messages : traités = 0 (ou TRUE pour dessin)
+            return if msg == WM_MENUCHAR { r } else if matches!(msg, WM_DRAWITEM | WM_MEASUREITEM) { LRESULT(1) } else { LRESULT(0) };
+        }
+    }
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
 /// Ouvre une nouvelle session Claude Code dans l'app Claude de bureau, sur ce dossier
