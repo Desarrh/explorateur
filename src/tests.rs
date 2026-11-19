@@ -136,6 +136,22 @@ fn bench_taille() {
 }
 
 #[test]
+fn conversion_par_le_lecteur() {
+    let Some(viewer) = crate::viewer::find() else {
+        eprintln!("lecteur universel absent : test sauté");
+        return;
+    };
+    let d = tmpdir("convert");
+    let src = d.join("carre.png");
+    image::RgbaImage::from_pixel(32, 32, image::Rgba([46, 94, 158, 255])).save(&src).unwrap();
+    let (created, errors) = crate::viewer::convert(&viewer, "webp", &[src]);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(created.len(), 1, "{created:?}");
+    assert_eq!(created[0].extension().unwrap(), "webp");
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
 fn taille_de_dossier() {
     let d = tmpdir("sizes");
     std::fs::create_dir_all(d.join("a").join("b")).unwrap();

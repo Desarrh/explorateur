@@ -12,6 +12,7 @@ mod tests;
 mod theme;
 mod thumbs;
 mod ui;
+mod viewer;
 mod winx;
 
 use egui_software_backend::{BufferMutRef, ColorFieldOrder, EguiSoftwareRender};

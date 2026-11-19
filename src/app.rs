@@ -42,6 +42,10 @@ pub struct Settings {
     /// Dossiers visités : nombre de visites et dernière visite (secondes Unix) → « Aller à ».
     pub visits: HashMap<String, (u32, i64)>,
     pub folder_sizes: bool,
+    /// Ouvrir images, PDF, Word, audio, vidéo, code dans le lecteur universel (double-clic, Entrée).
+    pub use_viewer: bool,
+    /// Dernier plantage déjà signalé (secondes Unix).
+    pub crash_seen: i64,
 }
 
 impl Default for Settings {
@@ -60,6 +64,8 @@ impl Default for Settings {
             window: None,
             visits: HashMap::new(),
             folder_sizes: true,
+            use_viewer: true,
+            crash_seen: 0,
         }
     }
 }
@@ -311,6 +317,8 @@ pub enum Action {
     OpenBatchRename,
     ClaudeHere(PathBuf),
     NativeMenu(Vec<PathBuf>),
+    OpenInViewer(Vec<PathBuf>),
+    Convert(String, Vec<PathBuf>),
 }
 
 /// État de la palette « Aller à » (Ctrl+P).
@@ -385,6 +393,8 @@ pub struct App {
     /// Aperçu plein écran (barre d'espace).
     pub fullview: Option<PathBuf>,
     pub batch: Option<BatchRename>,
+    /// Exe du lecteur universel, s'il est installé.
+    pub viewer: Option<PathBuf>,
     /// Dossiers demandés par une autre instance (boîte aux lettres).
     inbox_rx: Receiver<String>,
     pub bring_front: bool,
@@ -487,6 +497,7 @@ impl App {
             focus_right: false,
             fullview: None,
             batch: None,
+            viewer: crate::viewer::find(),
             inbox_rx,
             bring_front: false,
             #[cfg(windows)]
@@ -540,6 +551,19 @@ impl App {
             app.add_tab(p);
         }
         app.active = app.s.active.min(app.tabs.len() - 1);
+        // Plantage depuis la dernière fois ? On le signale une fois.
+        if let Some(log) = dirs::config_dir().map(|d| d.join("Explorateur").join("crash.log")) {
+            let mtime = std::fs::metadata(&log)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if mtime > app.s.crash_seen {
+                app.s.crash_seen = mtime;
+                app.toast(format!("L’explorateur s’est fermé brutalement la dernière fois — détails : {}", log.display()), true);
+            }
+        }
         app
     }
 
@@ -1516,8 +1540,13 @@ impl App {
                 }
             }
             Action::Open(p) => {
+                let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
                 if p.is_dir() {
                     self.navigate(p);
+                } else if let (true, Some(v), true) = (self.s.use_viewer, self.viewer.clone(), crate::viewer::handles(&ext)) {
+                    if !crate::viewer::open(&v, &[p.clone()]) {
+                        let _ = open::that_detached(&p);
+                    }
                 } else if let Err(e) = open::that_detached(&p) {
                     self.toast(format!("Impossible d’ouvrir : {e}"), true);
                 }
@@ -1861,6 +1890,19 @@ impl App {
                 }
             }
             Action::NativeMenu(v) => self.native_menu = Some(v),
+            Action::OpenInViewer(v) => match &self.viewer {
+                Some(exe) => {
+                    crate::viewer::open(exe, &v);
+                }
+                None => self.toast("Lecteur universel introuvable (C:\\Dev\\lecteur-universel)", true),
+            },
+            Action::Convert(fmt, files) => match self.viewer.clone() {
+                Some(viewer) => {
+                    self.toast(format!("Conversion en {} de {} fichier(s)…", fmt.to_uppercase(), files.len()), false);
+                    self.ops.submit(Op::Convert { viewer, fmt, files });
+                }
+                None => self.toast("Lecteur universel introuvable (C:\\Dev\\lecteur-universel)", true),
+            },
         }
     }
 

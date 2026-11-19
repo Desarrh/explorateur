@@ -273,6 +273,11 @@ impl App {
                 }
             }
             ui.checkbox(&mut self.s.preview, "Volet d’aperçu");
+            ui.add_enabled_ui(self.viewer.is_some(), |ui| {
+                ui.checkbox(&mut self.s.use_viewer, "Ouvrir les médias dans le lecteur universel")
+                    .on_hover_text("Images, PDF, Word, audio, vidéo et code s’ouvrent dans le lecteur (double-clic, Entrée)")
+                    .on_disabled_hover_text("Lecteur introuvable : compile C:\\Dev\\lecteur-universel");
+            });
             if ui.checkbox(&mut self.s.folder_sizes, "Taille des dossiers").changed() {
                 for t in &mut self.tabs {
                     t.view_dirty = true;
@@ -1003,6 +1008,7 @@ impl App {
         let tab_path = self.tab().path.clone();
         let multi = self.tab().selected.len() > 1 && selected;
         let split = self.split_other.is_some();
+        let has_viewer = self.viewer.is_some();
         if mods.shift {
             return;
         }
@@ -1024,6 +1030,21 @@ impl App {
             } else if ui.button("Ouvrir avec…").clicked() {
                 acts.push(Action::OpenWith(e.path.clone()));
                 ui.close();
+            }
+            if !e.is_dir && has_viewer && crate::viewer::handles(&e.ext) {
+                if ui.button("Ouvrir dans le lecteur").clicked() {
+                    acts.push(Action::OpenInViewer(targets.clone()));
+                    ui.close();
+                }
+                ui.menu_button("Convertir en", |ui| {
+                    let same = |f: &str| f == e.ext || (f == "jpg" && e.ext == "jpeg") || (f == "tiff" && e.ext == "tif");
+                    for fmt in crate::viewer::targets(&e.ext).iter().filter(|f| !same(f)) {
+                        if ui.button(fmt.to_uppercase()).clicked() {
+                            acts.push(Action::Convert(fmt.to_string(), targets.clone()));
+                            ui.close();
+                        }
+                    }
+                });
             }
             if ui.button("Ouvrir dans VS Code").clicked() {
                 acts.push(Action::Code(e.path.clone()));

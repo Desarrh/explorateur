@@ -14,6 +14,8 @@ pub enum Op {
     Delete(Vec<PathBuf>),
     Zip { srcs: Vec<PathBuf>, dst: PathBuf },
     Unzip { zip: PathBuf, dst: PathBuf },
+    /// Conversion par le lecteur universel.
+    Convert { viewer: PathBuf, fmt: String, files: Vec<PathBuf> },
     /// Annulation d'une création : corbeille, sans nouvelle entrée d'annulation.
     TrashForUndo(Vec<PathBuf>),
     /// Annulation : remettre des fichiers déplacés/renommés à leur place (to → from).
@@ -52,6 +54,7 @@ impl Op {
             Op::Delete(_) => "Suppression",
             Op::Zip { .. } => "Compression",
             Op::Unzip { .. } => "Extraction",
+            Op::Convert { .. } => "Conversion",
             Op::MoveBack(_) | Op::Restore { .. } | Op::TrashForUndo(_) => "Annulation",
         }
     }
@@ -190,6 +193,15 @@ fn run(op: Op, ev: &Sender<OpEvent>, cancel: &AtomicBool, ctx: &egui::Context) {
                 Err(e) => errors.push(e.to_string()),
             }
             touched = paths;
+        }
+        Op::Convert { viewer, fmt, files } => {
+            progress(0, files.len(), files.first().map(|p| p.as_path()).unwrap_or(Path::new("")));
+            let (created, errs) = crate::viewer::convert(&viewer, &fmt, &files);
+            errors.extend(errs);
+            touched = created.clone();
+            if !created.is_empty() {
+                undo = Some(Undo::Created(created));
+            }
         }
         Op::TrashForUndo(paths) => {
             let existing: Vec<PathBuf> = paths.into_iter().filter(|p| p.exists()).collect();
