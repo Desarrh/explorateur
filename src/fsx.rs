@@ -1,0 +1,280 @@
+//! Lecture des dossiers, métadonnées, formatage.
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+#[derive(Clone, Debug)]
+pub struct Entry {
+    pub name: String,
+    pub lower: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+    pub ext: String,
+    pub hidden: bool,
+    /// Pour les résultats de recherche récursive : chemin affiché relatif.
+    pub display: Option<String>,
+}
+
+impl Entry {
+    pub fn from_meta(path: PathBuf, meta: &std::fs::Metadata) -> Entry {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        let is_dir = meta.is_dir();
+        let ext = if is_dir {
+            String::new()
+        } else {
+            path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default()
+        };
+        Entry {
+            lower: name.to_lowercase(),
+            name,
+            path,
+            is_dir,
+            size: if is_dir { 0 } else { meta.len() },
+            modified: meta.modified().ok(),
+            ext,
+            hidden: is_hidden(meta),
+            display: None,
+        }
+    }
+
+    pub fn stat(path: &Path) -> Option<Entry> {
+        std::fs::metadata(path).ok().map(|m| Entry::from_meta(path.to_path_buf(), &m))
+    }
+
+    /// A-t-il une miniature (image, vidéo, PDF, Office…) ?
+    pub fn has_thumb(&self) -> bool {
+        !self.is_dir && (is_image_ext(&self.ext) || is_shell_thumb_ext(&self.ext))
+    }
+
+    pub fn is_video(&self) -> bool {
+        is_video_ext(&self.ext)
+    }
+}
+
+pub fn is_image_ext(ext: &str) -> bool {
+    matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico")
+}
+
+pub fn is_video_ext(ext: &str) -> bool {
+    matches!(ext, "mp4" | "mkv" | "avi" | "mov" | "webm" | "wmv" | "m4v" | "mpg" | "mpeg" | "flv" | "3gp" | "ts")
+}
+
+/// Formats que Windows sait réduire en miniature (selon les codecs installés).
+pub fn is_shell_thumb_ext(ext: &str) -> bool {
+    is_video_ext(ext)
+        || matches!(
+            ext,
+            "pdf" | "docx" | "doc" | "xlsx" | "pptx" | "odt" | "psd" | "heic" | "heif" | "avif" | "tif" | "tiff"
+                | "svg" | "mp3" | "flac" | "m4a" | "wma" | "jxl" | "raw" | "cr2" | "nef" | "dng" | "arw" | "blend"
+                | "aseprite" | "kra" | "3mf" | "stl" | "glb"
+        )
+}
+
+pub fn is_text_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "txt" | "md" | "rs" | "toml" | "json" | "js" | "ts" | "tsx" | "jsx" | "py" | "gd" | "tscn" | "tres"
+            | "godot" | "cfg" | "ini" | "yaml" | "yml" | "html" | "css" | "scss" | "c" | "h" | "cpp" | "hpp"
+            | "cs" | "java" | "go" | "sh" | "ps1" | "bat" | "xml" | "csv" | "log" | "sql" | "lua" | "kt"
+            | "swift" | "vue" | "svelte" | "env" | "gitignore" | "lock" | "svg"
+    )
+}
+
+#[cfg(windows)]
+fn is_hidden(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const HIDDEN: u32 = 0x2;
+    const SYSTEM: u32 = 0x4;
+    meta.file_attributes() & (HIDDEN | SYSTEM) != 0
+}
+#[cfg(not(windows))]
+fn is_hidden(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Sous Windows, `read_dir` utilise FindFirstFile/FindNextFile : la métadonnée
+/// de chaque entrée vient avec l'énumération, sans appel système en plus.
+pub fn list_dir(path: &Path) -> std::io::Result<Vec<Entry>> {
+    let mut out = Vec::new();
+    for de in std::fs::read_dir(path)? {
+        let Ok(de) = de else { continue };
+        let Ok(meta) = de.metadata() else { continue };
+        // Les liens symboliques / jonctions : suivre pour savoir si c'est un dossier.
+        let meta = if meta.file_type().is_symlink() {
+            std::fs::metadata(de.path()).unwrap_or(meta)
+        } else {
+            meta
+        };
+        out.push(Entry::from_meta(de.path(), &meta));
+    }
+    Ok(out)
+}
+
+pub struct Drive {
+    pub root: PathBuf,
+    pub label: String,
+    pub total: u64,
+    pub free: u64,
+}
+
+#[cfg(windows)]
+pub fn drives() -> Vec<Drive> {
+    use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetLogicalDrives};
+    let mask = unsafe { GetLogicalDrives() };
+    let mut v = Vec::new();
+    for i in 0..26u32 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let letter = (b'A' + i as u8) as char;
+        let root = format!("{letter}:\\");
+        let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+        let (mut free, mut total, mut tfree) = (0u64, 0u64, 0u64);
+        let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut tfree) };
+        if ok == 0 {
+            continue;
+        }
+        v.push(Drive { root: PathBuf::from(&root), label: format!("{letter}:"), total, free });
+    }
+    v
+}
+#[cfg(not(windows))]
+pub fn drives() -> Vec<Drive> {
+    vec![]
+}
+
+pub fn human_size(n: u64) -> String {
+    const U: [&str; 5] = ["o", "Ko", "Mo", "Go", "To"];
+    if n < 1024 {
+        return format!("{n} o");
+    }
+    let mut f = n as f64;
+    let mut i = 0;
+    while f >= 1024.0 && i < U.len() - 1 {
+        f /= 1024.0;
+        i += 1;
+    }
+    let s = if f < 10.0 { format!("{f:.1}") } else { format!("{f:.0}") };
+    format!("{} {}", s.replace('.', ","), U[i])
+}
+
+pub fn human_time(t: Option<SystemTime>) -> String {
+    use chrono::{DateTime, Local};
+    let Some(t) = t else { return String::new() };
+    let now = SystemTime::now();
+    if let Ok(d) = now.duration_since(t) {
+        let s = d.as_secs();
+        if s < 10 {
+            return "à l’instant".into();
+        }
+        if s < 60 {
+            return format!("il y a {s} s");
+        }
+        if s < 3600 {
+            return format!("il y a {} min", s / 60);
+        }
+    }
+    let dt: DateTime<Local> = t.into();
+    let today = Local::now().date_naive();
+    let day = dt.date_naive();
+    if day == today {
+        format!("aujourd’hui {}", dt.format("%H:%M"))
+    } else if Some(day) == today.pred_opt() {
+        format!("hier {}", dt.format("%H:%M"))
+    } else {
+        dt.format("%d/%m/%Y %H:%M").to_string()
+    }
+}
+
+pub fn kind_label(e: &Entry) -> String {
+    if e.is_dir {
+        return "Dossier".into();
+    }
+    match e.ext.as_str() {
+        "" => "Fichier".into(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" => format!("Image {}", e.ext.to_uppercase()),
+        "txt" => "Texte".into(),
+        "md" => "Markdown".into(),
+        "pdf" => "PDF".into(),
+        "exe" => "Application".into(),
+        "zip" | "7z" | "rar" => "Archive".into(),
+        other => format!("Fichier {}", other.to_uppercase()),
+    }
+}
+
+pub fn icon_for(e: &Entry) -> &'static str {
+    if e.is_dir {
+        return "📁";
+    }
+    match e.ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "svg" => "🖼",
+        "mp3" | "wav" | "ogg" | "flac" => "🎵",
+        "mp4" | "mkv" | "avi" | "mov" | "webm" => "🎞",
+        "zip" | "7z" | "rar" | "tar" | "gz" => "📦",
+        "exe" | "msi" | "bat" | "cmd" | "ps1" => "⚙",
+        "pdf" => "📕",
+        _ if is_text_ext(&e.ext) => "📝",
+        _ => "📄",
+    }
+}
+
+/// Nom libre dans `dir` : « nom », « nom (2) », « nom (3) »…
+pub fn unique_name(dir: &Path, name: &str) -> PathBuf {
+    let cand = dir.join(name);
+    if !cand.exists() {
+        return cand;
+    }
+    let p = Path::new(name);
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    for i in 2.. {
+        let c = dir.join(format!("{stem} ({i}){ext}"));
+        if !c.exists() {
+            return c;
+        }
+    }
+    unreachable!()
+}
+
+/// Score flou (sous-séquence). `None` si pas de correspondance.
+pub fn fuzzy_score(hay_lower: &str, needle_lower: &str) -> Option<i32> {
+    if needle_lower.is_empty() {
+        return Some(0);
+    }
+    if let Some(pos) = hay_lower.find(needle_lower) {
+        return Some(1000 - pos as i32 * 2 - hay_lower.len() as i32);
+    }
+    let mut score = 0;
+    let mut it = hay_lower.chars().enumerate();
+    let mut last = None::<usize>;
+    for nc in needle_lower.chars() {
+        loop {
+            let (i, hc) = it.next()?;
+            if hc == nc {
+                score += match last {
+                    Some(l) if l + 1 == i => 8,
+                    _ => 1,
+                };
+                last = Some(i);
+                break;
+            }
+        }
+    }
+    Some(score - hay_lower.len() as i32 / 4)
+}
+
+pub fn read_text_preview(path: &Path, max: usize) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; max];
+    let n = f.read(&mut buf).ok()?;
+    buf.truncate(n);
+    if buf.iter().take(2048).any(|&b| b == 0) {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}

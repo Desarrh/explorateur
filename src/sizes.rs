@@ -1,0 +1,209 @@
+//! Taille des dossiers, façon WizTree (sans droits admin) :
+//! - parcours parallèle (vol de tâches rayon, plusieurs dossiers lus en même temps) ;
+//! - lecture des dossiers par gros blocs (FindFirstFileExW + FIND_FIRST_EX_LARGE_FETCH,
+//!   FindExInfoBasic) : taille et attributs viennent avec l'énumération, aucun appel en plus ;
+//! - chaque sous-dossier rencontré est mémorisé : entrer dans un dossier déjà scanné
+//!   affiche les tailles instantanément.
+//! Changer de dossier annule le calcul en cours (numéro de génération).
+//! (WizTree va encore plus vite en lisant la MFT NTFS, mais il faut être administrateur.)
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// Profondeur jusqu'à laquelle on garde les tailles des sous-dossiers en cache.
+const KEEP_DEPTH: usize = 6;
+const MAX_CACHE: usize = 300_000;
+
+pub struct Sizes {
+    tx: Sender<(u64, Vec<PathBuf>)>,
+    rx: Receiver<Vec<(PathBuf, u64)>>,
+    current: Arc<AtomicU64>,
+    pub map: HashMap<PathBuf, u64>,
+    pending: HashSet<PathBuf>,
+}
+
+impl Sizes {
+    pub fn new(ctx: &egui::Context) -> Self {
+        let (tx, req_rx) = unbounded::<(u64, Vec<PathBuf>)>();
+        let (res_tx, rx) = unbounded();
+        let current = Arc::new(AtomicU64::new(0));
+        let cur = current.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            // Disques SSD : beaucoup de lectures en parallèle paient.
+            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(4, 16);
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
+            while let Ok((g, dirs)) = req_rx.recv() {
+                if g != cur.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let res_tx = res_tx.clone();
+                let ctx = ctx.clone();
+                let cur = cur.clone();
+                pool.install(|| {
+                    dirs.par_iter().for_each(|d| {
+                        let found = Mutex::new(Vec::new());
+                        if let Some(total) = walk(d, 0, g, &cur, &found) {
+                            let mut v = found.into_inner().unwrap_or_default();
+                            v.push((d.clone(), total));
+                            let _ = res_tx.send(v);
+                            ctx.request_repaint();
+                        }
+                    });
+                });
+            }
+        });
+        Sizes { tx, rx, current, map: HashMap::new(), pending: HashSet::new() }
+    }
+
+    /// Calcule les dossiers donnés (ceux du dossier affiché), en abandonnant les anciens.
+    pub fn focus(&mut self, dirs: Vec<PathBuf>) {
+        let g = self.current.fetch_add(1, Ordering::Relaxed) + 1;
+        self.pending.clear();
+        let todo: Vec<PathBuf> = dirs.into_iter().filter(|d| !self.map.contains_key(d)).collect();
+        if todo.is_empty() {
+            return;
+        }
+        self.pending.extend(todo.iter().cloned());
+        let _ = self.tx.send((g, todo));
+    }
+
+    /// `true` si de nouvelles tailles sont arrivées.
+    pub fn poll(&mut self) -> bool {
+        let mut any = false;
+        while let Ok(batch) = self.rx.try_recv() {
+            for (p, s) in batch {
+                self.pending.remove(&p);
+                self.map.insert(p, s);
+            }
+            any = true;
+        }
+        if self.map.len() > MAX_CACHE {
+            self.map.clear();
+        }
+        any
+    }
+
+    pub fn is_pending(&self, p: &Path) -> bool {
+        self.pending.contains(p)
+    }
+
+    /// Un fichier a changé : les tailles des dossiers qui le contiennent sont périmées.
+    pub fn invalidate(&mut self, changed: &Path) -> bool {
+        let before = self.map.len();
+        // On ne retire que les ancêtres du fichier (pas de parcours complet de la carte).
+        let mut a = changed.parent();
+        while let Some(p) = a {
+            self.map.remove(p);
+            a = p.parent();
+        }
+        self.map.remove(changed);
+        self.map.len() != before
+    }
+}
+
+/// Taille totale d'un dossier. `None` si annulé.
+fn walk(dir: &Path, depth: usize, g: u64, cur: &AtomicU64, found: &Mutex<Vec<(PathBuf, u64)>>) -> Option<u64> {
+    if g != cur.load(Ordering::Relaxed) {
+        return None;
+    }
+    let (files, subdirs) = list(dir);
+    let sub: Option<u64> = if subdirs.len() > 1 {
+        subdirs.par_iter().map(|s| walk(s, depth + 1, g, cur, found)).try_reduce(|| 0, |a, b| Some(a + b))
+    } else {
+        subdirs.iter().try_fold(0u64, |acc, s| walk(s, depth + 1, g, cur, found).map(|v| acc + v))
+    };
+    let total = files + sub?;
+    if depth > 0 && depth <= KEEP_DEPTH {
+        if let Ok(mut f) = found.lock() {
+            f.push((dir.to_path_buf(), total));
+        }
+    }
+    Some(total)
+}
+
+/// Somme des fichiers d'un dossier + liste de ses sous-dossiers (sans suivre liens ni jonctions).
+#[cfg(windows)]
+fn list(dir: &Path) -> (u64, Vec<PathBuf>) {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FIND_FIRST_EX_LARGE_FETCH, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FindClose, FindExInfoBasic,
+        FindExSearchNameMatch, FindFirstFileExW, FindNextFileW, WIN32_FIND_DATAW,
+    };
+    // Préfixe \\?\ : chemins de plus de 260 caractères.
+    let s = dir.as_os_str().to_string_lossy();
+    let pattern = if s.starts_with(r"\\?\") {
+        format!(r"{}\*", s.trim_end_matches('\\'))
+    } else if let Some(unc) = s.strip_prefix(r"\\") {
+        format!(r"\\?\UNC\{}\*", unc.trim_end_matches('\\'))
+    } else {
+        format!(r"\\?\{}\*", s.trim_end_matches('\\'))
+    };
+    let wide: Vec<u16> = std::ffi::OsStr::new(&pattern).encode_wide().chain(std::iter::once(0)).collect();
+    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    let h = unsafe {
+        FindFirstFileExW(wide.as_ptr(), FindExInfoBasic, &mut data as *mut _ as *mut _, FindExSearchNameMatch, std::ptr::null(), FIND_FIRST_EX_LARGE_FETCH)
+    };
+    let mut files = 0u64;
+    let mut dirs = Vec::new();
+    if h == INVALID_HANDLE_VALUE {
+        return (0, dirs);
+    }
+    loop {
+        let name_len = data.cFileName.iter().position(|&c| c == 0).unwrap_or(data.cFileName.len());
+        let name = &data.cFileName[..name_len];
+        let dot = name == [b'.' as u16] || name == [b'.' as u16, b'.' as u16];
+        if !dot {
+            let attr = data.dwFileAttributes;
+            if attr & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                // On ne suit pas les liens symboliques ni les jonctions (« name surrogate »),
+                // mais on entre dans les dossiers OneDrive / cloud, qui sont aussi des points d'analyse.
+                let surrogate = attr & FILE_ATTRIBUTE_REPARSE_POINT != 0 && data.dwReserved0 & 0x2000_0000 != 0;
+                if !surrogate {
+                    dirs.push(dir.join(std::ffi::OsString::from_wide(name)));
+                }
+            } else {
+                files += ((data.nFileSizeHigh as u64) << 32) | data.nFileSizeLow as u64;
+            }
+        }
+        if unsafe { FindNextFileW(h, &mut data) } == 0 {
+            break;
+        }
+    }
+    unsafe { FindClose(h) };
+    (files, dirs)
+}
+
+#[cfg(not(windows))]
+fn list(dir: &Path) -> (u64, Vec<PathBuf>) {
+    let mut files = 0;
+    let mut dirs = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                dirs.push(e.path());
+            } else if let Ok(m) = e.metadata() {
+                files += m.len();
+            }
+        }
+    }
+    (files, dirs)
+}
+
+/// Mesure de vitesse : `cargo test --release bench_taille -- --ignored --nocapture`
+#[cfg(test)]
+pub fn bench(dir: &Path) -> (u64, usize, std::time::Duration) {
+    let cur = AtomicU64::new(1);
+    let found = Mutex::new(Vec::new());
+    let t0 = std::time::Instant::now();
+    let total = walk(dir, 0, 1, &cur, &found).unwrap_or(0);
+    (total, found.into_inner().unwrap().len(), t0.elapsed())
+}
