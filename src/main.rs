@@ -220,7 +220,30 @@ fn window_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
+/// Journal de plantage : %APPDATA%\Explorateur\crash.log (message, emplacement, pile d'appels).
+fn install_crash_log() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(dir) = dirs::config_dir().map(|d| d.join("Explorateur")) {
+            let _ = std::fs::create_dir_all(&dir);
+            let bt = std::backtrace::Backtrace::force_capture();
+            let thread = std::thread::current().name().unwrap_or("?").to_string();
+            let entry = format!(
+                "==== {} · v{} · thread {thread}\n{info}\n{bt}\n",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                env!("CARGO_PKG_VERSION"),
+            );
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("crash.log")) {
+                let _ = f.write_all(entry.as_bytes());
+            }
+        }
+        default(info);
+    }));
+}
+
 fn main() {
+    install_crash_log();
     // Déjà ouvert ? On transmet le dossier à la fenêtre existante (nouvel onglet) et on s'arrête.
     #[cfg(windows)]
     if winx::single::another_running() {

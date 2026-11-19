@@ -219,11 +219,18 @@ pub struct Repo {
     pub last: Option<(String, bool)>,
     pub by_path: HashMap<PathBuf, git::Kind>,
     pub loaded: bool,
+    /// Règles .gitignore du dépôt (racine + .git/info/exclude) : filtrent le flux d'activité.
+    pub ignore: Option<ignore::gitignore::Gitignore>,
 }
 
 impl Repo {
     fn new(root: PathBuf) -> Repo {
+        let mut b = ignore::gitignore::GitignoreBuilder::new(&root);
+        let _ = b.add(root.join(".gitignore"));
+        let _ = b.add(root.join(".git").join("info").join("exclude"));
+        let ignore = b.build().ok();
         Repo {
+            ignore,
             root,
             branch: String::new(),
             ahead: String::new(),
@@ -770,6 +777,7 @@ impl App {
         }
         let tab_dirs: HashSet<PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
         let root = self.repo.as_ref().map(|r| r.root.clone());
+        let gi = self.repo.as_ref().and_then(|r| r.ignore.clone());
         let sel_abs = self.repo.as_ref().and_then(|r| r.selected.as_ref().map(|s| r.root.join(s)));
         for (p, first) in evs {
             let in_tab = p.parent().map(|d| tab_dirs.contains(d)).unwrap_or(false);
@@ -807,7 +815,16 @@ impl App {
                 self.preview_cache = None;
             }
             let in_repo = root.as_ref().map(|r| p.starts_with(r)).unwrap_or(false);
-            if in_repo {
+            // Fichier ignoré par git (build, cache…) : ni dans le flux d'activité, ni dans le statut.
+            let git_ignored = in_repo
+                && gi
+                    .as_ref()
+                    .map(|g| g.matched_path_or_any_parents(&p, exists && p.is_dir()).is_ignore())
+                    .unwrap_or(false);
+            if git_ignored && !in_tab {
+                continue;
+            }
+            if in_repo && !git_ignored {
                 self.git_dirty_at = Some(Instant::now());
             }
             if sel_abs.as_ref() == Some(&p) {
@@ -816,7 +833,13 @@ impl App {
             if exists && p.is_dir() && applied == Act::Modified {
                 continue;
             }
-            if (in_repo || in_tab) && !self.activity_paused {
+            if in_repo && p.file_name().map(|n| n == ".gitignore").unwrap_or(false) {
+                if let Some(r) = self.repo.as_mut() {
+                    let fresh = Repo::new(r.root.clone());
+                    r.ignore = fresh.ignore;
+                }
+            }
+            if (in_repo || in_tab) && !git_ignored && !self.activity_paused {
                 let label = match &root {
                     Some(r) if in_repo => p.strip_prefix(r).map(|x| x.to_string_lossy().replace('\\', "/")).unwrap_or_default(),
                     _ => p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -1032,41 +1055,69 @@ impl App {
         let tx = self.load_tx.clone();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let mut stack = vec![root.clone()];
-            let mut batch = Vec::new();
-            let mut total = 0usize;
-            let mut last = Instant::now();
-            while let Some(dir) = stack.pop() {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-                for de in rd.flatten() {
-                    let Ok(meta) = de.metadata() else { continue };
-                    let name = de.file_name().to_string_lossy().to_lowercase();
-                    if meta.is_dir() && !meta.file_type().is_symlink() {
-                        if !(name == ".git" || NOISY.contains(&name.as_str())) {
-                            stack.push(de.path());
+            // Parcours parallèle (celui de ripgrep) qui respecte .gitignore, .git/info/exclude
+            // et .ignore dans les dépôts git ; ailleurs, seuls les dossiers « bruyants » sont sautés.
+            let (etx, erx) = unbounded::<Entry>();
+            let found = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let walker = ignore::WalkBuilder::new(&root)
+                .hidden(false)
+                .git_ignore(true)
+                .git_exclude(true)
+                .git_global(false)
+                .require_git(true)
+                .follow_links(false)
+                .threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12))
+                .filter_entry(|e| {
+                    let n = e.file_name().to_string_lossy().to_lowercase();
+                    !(e.depth() > 0 && e.file_type().map(|t| t.is_dir()).unwrap_or(false) && (n == ".git" || NOISY.contains(&n.as_str())))
+                })
+                .build_parallel();
+            let collector = {
+                let (tx, ctx, root) = (tx.clone(), ctx.clone(), root.clone());
+                std::thread::spawn(move || {
+                    let mut batch = Vec::new();
+                    let mut last = Instant::now();
+                    loop {
+                        match erx.recv_timeout(Duration::from_millis(100)) {
+                            Ok(mut e) => {
+                                e.display = e.path.strip_prefix(&root).ok().map(|r| r.to_string_lossy().into_owned());
+                                batch.push(e);
+                            }
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                            Err(_) => break,
+                        }
+                        if !batch.is_empty() && (batch.len() > 300 || last.elapsed() > Duration::from_millis(120)) {
+                            let _ = tx.send(LoadMsg::Search { tab: id, generation, batch: std::mem::take(&mut batch), done: false });
+                            ctx.request_repaint();
+                            last = Instant::now();
                         }
                     }
-                    if name.contains(&needle) {
-                        let mut e = Entry::from_meta(de.path(), &meta);
-                        e.display = de.path().strip_prefix(&root).ok().map(|r| r.to_string_lossy().into_owned());
-                        batch.push(e);
-                        total += 1;
-                    }
-                }
-                if !batch.is_empty() && (batch.len() > 300 || last.elapsed() > Duration::from_millis(120)) {
-                    let _ = tx.send(LoadMsg::Search { tab: id, generation, batch: std::mem::take(&mut batch), done: false });
+                    let _ = tx.send(LoadMsg::Search { tab: id, generation, batch, done: true });
                     ctx.request_repaint();
-                    last = Instant::now();
-                }
-                if total > 20_000 {
-                    break;
-                }
-            }
-            let _ = tx.send(LoadMsg::Search { tab: id, generation, batch, done: true });
-            ctx.request_repaint();
+                })
+            };
+            walker.run(|| {
+                let (etx, cancel, found, needle) = (etx.clone(), cancel.clone(), found.clone(), needle.clone());
+                Box::new(move |res| {
+                    use ignore::WalkState;
+                    if cancel.load(Ordering::Relaxed) || found.load(Ordering::Relaxed) > 20_000 {
+                        return WalkState::Quit;
+                    }
+                    let Ok(de) = res else { return WalkState::Continue };
+                    if de.depth() == 0 {
+                        return WalkState::Continue;
+                    }
+                    if de.file_name().to_string_lossy().to_lowercase().contains(&needle) {
+                        if let Ok(meta) = de.metadata() {
+                            found.fetch_add(1, Ordering::Relaxed);
+                            let _ = etx.send(Entry::from_meta(de.path().to_path_buf(), &meta));
+                        }
+                    }
+                    WalkState::Continue
+                })
+            });
+            drop(etx);
+            let _ = collector.join();
         });
     }
 
