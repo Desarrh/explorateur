@@ -5,6 +5,7 @@ mod app;
 mod extras;
 mod fsx;
 mod git;
+mod index;
 mod ops;
 mod sizes;
 #[cfg(test)]

@@ -44,6 +44,8 @@ pub struct Settings {
     pub folder_sizes: bool,
     /// Ouvrir images, PDF, Word, audio, vidéo, code dans le lecteur universel (double-clic, Entrée).
     pub use_viewer: bool,
+    /// Index global de tous les fichiers (recherche instantanée dans Ctrl+P).
+    pub global_index: bool,
     /// Dernier plantage déjà signalé (secondes Unix).
     pub crash_seen: i64,
 }
@@ -65,6 +67,7 @@ impl Default for Settings {
             visits: HashMap::new(),
             folder_sizes: true,
             use_viewer: true,
+            global_index: true,
             crash_seen: 0,
         }
     }
@@ -326,6 +329,9 @@ pub struct Goto {
     pub query: String,
     pub sel: usize,
     pub fresh: bool,
+    /// Résultats de l'index global pour hits_q (recalculés seulement quand la saisie change).
+    pub hits: Vec<(PathBuf, bool, String)>,
+    pub hits_q: String,
 }
 
 /// Renommage en lot.
@@ -395,6 +401,7 @@ pub struct App {
     pub batch: Option<BatchRename>,
     /// Exe du lecteur universel, s'il est installé.
     pub viewer: Option<PathBuf>,
+    pub index: Option<crate::index::Index>,
     /// Dossiers demandés par une autre instance (boîte aux lettres).
     inbox_rx: Receiver<String>,
     pub bring_front: bool,
@@ -498,6 +505,7 @@ impl App {
             fullview: None,
             batch: None,
             viewer: crate::viewer::find(),
+            index: None,
             inbox_rx,
             bring_front: false,
             #[cfg(windows)]
@@ -551,6 +559,9 @@ impl App {
             app.add_tab(p);
         }
         app.active = app.s.active.min(app.tabs.len() - 1);
+        if app.s.global_index {
+            app.index = Some(crate::index::Index::start(&ctx));
+        }
         // Plantage depuis la dernière fois ? On le signale une fois.
         if let Some(log) = dirs::config_dir().map(|d| d.join("Explorateur").join("crash.log")) {
             let mtime = std::fs::metadata(&log)
@@ -1865,7 +1876,9 @@ impl App {
                 }
                 self.ops.submit(if mv { Op::Move { srcs: sel, dst } } else { Op::Copy { srcs: sel, dst } });
             }
-            Action::OpenGoto => self.goto = Some(Goto { query: String::new(), sel: 0, fresh: true }),
+            Action::OpenGoto => {
+                self.goto = Some(Goto { query: String::new(), sel: 0, fresh: true, hits: vec![], hits_q: String::new() })
+            }
             Action::FullView(p) => self.fullview = Some(p),
             Action::OpenBatchRename => {
                 let paths = self.tab().selection();

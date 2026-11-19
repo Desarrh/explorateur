@@ -278,6 +278,13 @@ impl App {
                     .on_hover_text("Images, PDF, Word, audio, vidéo et code s’ouvrent dans le lecteur (double-clic, Entrée)")
                     .on_disabled_hover_text("Lecteur introuvable : compile C:\\Dev\\lecteur-universel");
             });
+            if ui
+                .checkbox(&mut self.s.global_index, "Recherche dans tous les disques (Ctrl+P)")
+                .on_hover_text("Index de tous les noms de fichiers, reconstruit en arrière-plan. Environ 40 octets par fichier en mémoire.")
+                .changed()
+            {
+                self.index = if self.s.global_index { Some(crate::index::Index::start(&self.ctx)) } else { None };
+            }
             if ui.checkbox(&mut self.s.folder_sizes, "Taille des dossiers").changed() {
                 for t in &mut self.tabs {
                     t.view_dirty = true;

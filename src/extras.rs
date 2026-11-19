@@ -48,12 +48,50 @@ impl App {
             })
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let results: Vec<String> = scored.into_iter().map(|x| x.1).filter(|p| Path::new(p).is_dir()).take(12).collect();
+        let folders: Vec<String> = scored.into_iter().map(|x| x.1).filter(|p| Path::new(p).is_dir()).take(if q.len() >= 2 { 6 } else { 12 }).collect();
+        // Index global : tous les fichiers des disques (recalculé seulement quand la saisie change)
+        let (indexed, scanning) = match &self.index {
+            Some(ix) => (ix.data.read().map(|d| d.len()).unwrap_or(0), ix.scanning.load(std::sync::atomic::Ordering::Relaxed)),
+            None => (0, false),
+        };
+        if g.hits_q != q {
+            g.hits_q = q.clone();
+            g.hits = match &self.index {
+                Some(ix) if q.len() >= 2 => ix
+                    .data
+                    .read()
+                    .map(|d| d.search(&q, 40))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|h| !folders.iter().any(|f| f.to_lowercase() == h.path.to_string_lossy()))
+                    .filter(|h| h.path.exists())
+                    .take(12)
+                    .map(|h| {
+                        // vraie casse, relue seulement pour les résultats affichés
+                        let path = crate::index::real_case(&h.path);
+                        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or(h.name);
+                        (path, h.is_dir, name)
+                    })
+                    .collect(),
+                _ => vec![],
+            };
+        }
+        // Liste unique : (chemin, dossier ?, nom affiché, vient de l'index ?)
+        let mut results: Vec<(PathBuf, bool, String, bool)> = folders
+            .iter()
+            .map(|f| {
+                let pb = PathBuf::from(f);
+                let name = pb.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| f.clone());
+                (pb, true, name, false)
+            })
+            .collect();
+        results.extend(g.hits.iter().map(|(p, d, n)| (p.clone(), *d, n.clone(), true)));
         if g.sel >= results.len() {
             g.sel = results.len().saturating_sub(1);
         }
 
-        let mut go: Option<(PathBuf, bool)> = None;
+        // (chemin, ctrl, dossier ?)
+        let mut go: Option<(PathBuf, bool, bool)> = None;
         let mut close = false;
         let (up, down, enter, esc, ctrl) = ctx.input_mut(|i| {
             use egui::{Key, Modifiers as M};
@@ -76,9 +114,9 @@ impl App {
         }
         if enter {
             if let Some(r) = results.get(g.sel) {
-                go = Some((PathBuf::from(r), ctrl));
+                go = Some((r.0.clone(), ctrl, r.1));
             } else if Path::new(g.query.trim()).is_dir() {
-                go = Some((PathBuf::from(g.query.trim()), ctrl));
+                go = Some((PathBuf::from(g.query.trim()), ctrl, true));
             }
         }
 
@@ -124,30 +162,50 @@ impl App {
                         });
                         ui.add_space(6.0);
                         if results.is_empty() {
-                            ui.label(RichText::new("Aucun dossier connu ne correspond. Entrée ouvre un chemin tapé en entier.").color(p.muted));
+                            ui.label(RichText::new("Rien ne correspond. Entrée ouvre un chemin tapé en entier.").color(p.muted));
                         }
-                        for (k, path) in results.iter().enumerate() {
+                        let mut shown_header = false;
+                        for (k, (pb, is_dir, name, from_index)) in results.iter().enumerate() {
+                            if *from_index && !shown_header {
+                                shown_header = true;
+                                ui.add_space(4.0);
+                                ui.label(RichText::new("SUR LES DISQUES").size(11.0).strong().color(p.muted));
+                            }
                             let (rect, resp) = ui.allocate_exact_size(vec2(w, 40.0), Sense::click());
                             let on = k == g.sel;
                             if on || resp.hovered() {
                                 ui.painter().rect_filled(rect, CornerRadius::same(8), if on { p.sel_bg } else { p.hover_bg });
                             }
-                            let pb = Path::new(path);
-                            let name = pb.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
-                            ui.painter().text(pos2(rect.left() + 12.0, rect.top() + 12.0), Align2::LEFT_CENTER, &name, FontId::proportional(14.5), p.text);
+                            let icon = if *is_dir { "📁" } else { "📄" };
+                            ui.painter().text(pos2(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, icon, FontId::proportional(15.0), if *is_dir { p.accent } else { p.muted });
+                            ui.painter().text(pos2(rect.left() + 38.0, rect.top() + 12.0), Align2::LEFT_CENTER, name, FontId::proportional(14.5), p.text);
                             let parent = pb.parent().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
-                            ui.painter().text(pos2(rect.left() + 12.0, rect.top() + 29.0), Align2::LEFT_CENTER, &parent, FontId::proportional(11.5), p.muted);
+                            ui.painter().text(pos2(rect.left() + 38.0, rect.top() + 29.0), Align2::LEFT_CENTER, &parent, FontId::proportional(11.5), p.muted);
                             if resp.clicked() {
-                                go = Some((pb.to_path_buf(), ui.input(|i| i.modifiers.command)));
+                                go = Some((pb.clone(), ui.input(|i| i.modifiers.command), *is_dir));
                             }
                         }
                         ui.add_space(4.0);
-                        ui.label(RichText::new("↑↓ choisir · Entrée ouvrir · Ctrl+Entrée nouvel onglet · Échap fermer").size(11.5).color(p.muted));
+                        let idx_info = match (&self.index, indexed, scanning) {
+                            (None, _, _) => "index global désactivé (menu ⋯)".to_string(),
+                            (Some(_), 0, true) => "index des disques en construction…".to_string(),
+                            (Some(_), n, s) => format!("{} éléments indexés{}", fmt_count(n), if s { " · mise à jour…" } else { "" }),
+                        };
+                        ui.label(
+                            RichText::new(format!("↑↓ choisir · Entrée ouvrir · Ctrl+Entrée nouvel onglet / ouvrir le fichier · Échap fermer   —   {idx_info}"))
+                                .size(11.5)
+                                .color(p.muted),
+                        );
                     });
             });
-        if let Some((path, new_tab)) = go {
+        if let Some((path, ctrl, is_dir)) = go {
             self.goto = None;
-            self.actions.push(if new_tab { Action::NewTab(path) } else { Action::Navigate(path) });
+            self.actions.push(match (is_dir, ctrl) {
+                (true, false) => Action::Navigate(path),
+                (true, true) => Action::NewTab(path),
+                (false, false) => Action::ShowInFolder(path),
+                (false, true) => Action::Open(path),
+            });
         } else if close {
             self.goto = None;
         }
@@ -384,6 +442,18 @@ impl App {
             self.toast(format!("{n} renommé(s), erreurs : {}", errors.join(" · ")), true);
         }
     }
+}
+
+fn fmt_count(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push('\u{202F}');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Calcule les nouveaux noms du renommage en lot.

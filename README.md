@@ -21,13 +21,16 @@ Ce que ça change : quelques clés dans `HKEY_CURRENT_USER\Software\Classes` (`D
 barre des tâches restent gérés par Windows. Garde l'exe à sa place (`dist\Explorateur.exe`), le
 registre pointe vers lui.
 
-## Compiler
+## Mettre à jour
 
 ```powershell
-cargo build --release
+powershell -ExecutionPolicy Bypass -File scripts\maj.ps1
 ```
 
-L'exécutable sort dans `target\release\explorateur.exe` ; copie-le dans `dist\` pour remplacer la version prête à lancer.
+Le script compile, ferme l'app si elle est ouverte (réglages enregistrés), remplace `dist\Explorateur.exe`
+et la relance. Tests : `cargo test --release`.
+
+En cas de plantage, le détail est dans `%APPDATA%\Explorateur\crash.log` et l'app le signale au lancement suivant.
 
 ## Ce qu'il fait
 
@@ -53,7 +56,12 @@ L'exécutable sort dans `target\release\explorateur.exe` ; copie-le dans `dist\`
 **Confort**
 - **Double volet** (F3) : deux dossiers côte à côte, F6 copie et Maj+F6 déplace vers l'autre volet,
   le glisser-déposer marche aussi entre les deux
-- **Aller à** (Ctrl+P) : recherche floue sur tes dossiers fréquents et récents, épinglés, disques
+- **Aller à** (Ctrl+P) : recherche floue sur tes dossiers fréquents et récents, épinglés, disques,
+  **plus tous les fichiers de tes disques** à la manière d'Everything : index de ~2 millions de noms,
+  recherche en ~5 ms, ~80 Mo de mémoire, reconstruit en arrière-plan au lancement puis toutes les 20 min
+  (désactivable dans ⋯). Entrée sur un fichier = l'afficher dans son dossier, Ctrl+Entrée = l'ouvrir
+- **Lecteur universel** : double-clic sur une image, un PDF, un Word, un son, une vidéo ou du code
+  l'ouvre dans `C:\Dev\lecteur-universel` (réglable dans ⋯) ; clic droit → « Convertir en › »
 - **Annuler** (Ctrl+Z) : copie, déplacement, renommage (même en lot), nouveau dossier, corbeille, zip
 - **Taille des dossiers** calculée en arrière-plan (colonne Taille, tri par taille), façon WizTree
   sans droits admin : parcours parallèle, lecture par gros blocs (`FindFirstFileExW`), sous-dossiers
@@ -108,5 +116,7 @@ pilote graphique : environ 40 Mo en mémoire, exe de 7 Mo. Réglages dans
 
 - Pas le menu clic droit natif de Windows (extensions 7-Zip, etc.) : utiliser « Afficher dans l'Explorateur ».
 - Pas de lecture vidéo intégrée : l'aperçu montre une image de la vidéo, le clic l'ouvre dans le lecteur.
-- La recherche récursive parcourt le disque à chaque fois (pas encore d'index permanent).
+- L'index global n'est pas mis à jour en direct (Everything lit le journal NTFS avec un service
+  administrateur) : un fichier créé il y a moins de 20 min peut manquer dans Ctrl+P.
+- La recherche du champ Filtrer (bouton ⤵) respecte le `.gitignore` dans les dépôts git.
 - Git passe par la commande `git` installée.
