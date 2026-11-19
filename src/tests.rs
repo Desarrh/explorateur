@@ -192,6 +192,17 @@ fn bench_index() {
 }
 
 #[test]
+fn comparaison_de_versions() {
+    use crate::updater::is_newer;
+    assert!(is_newer("v0.3.0", "0.2.0"));
+    assert!(is_newer("v0.2.1", "0.2.0"));
+    assert!(is_newer("1.0", "0.9.9"));
+    assert!(!is_newer("v0.2.0", "0.2.0"));
+    assert!(!is_newer("v0.1.9", "0.2.0"));
+    assert!(!is_newer("nimporte", "0.2.0"));
+}
+
+#[test]
 fn taille_de_dossier() {
     let d = tmpdir("sizes");
     std::fs::create_dir_all(d.join("a").join("b")).unwrap();

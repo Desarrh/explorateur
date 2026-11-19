@@ -13,6 +13,7 @@ mod tests;
 mod theme;
 mod thumbs;
 mod ui;
+mod updater;
 mod viewer;
 mod winx;
 
@@ -246,9 +247,15 @@ fn install_crash_log() {
 
 fn main() {
     install_crash_log();
+    updater::cleanup_old();
+    // Relancé par une mise à jour : l'ancienne instance est en train de se fermer, on ne lui transmet rien.
+    let after_update = std::env::args().any(|a| a == "--after-update");
+    if after_update {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+    }
     // Déjà ouvert ? On transmet le dossier à la fenêtre existante (nouvel onglet) et on s'arrête.
     #[cfg(windows)]
-    if winx::single::another_running() {
+    if !after_update && winx::single::another_running() {
         let arg = std::env::args().nth(1).map(std::path::PathBuf::from).filter(|p| p.is_dir());
         if winx::single::forward(arg) {
             return;

@@ -46,6 +46,9 @@ pub struct Settings {
     pub use_viewer: bool,
     /// Index global de tous les fichiers (recherche instantanée dans Ctrl+P).
     pub global_index: bool,
+    /// Vérifier les mises à jour sur GitHub (au plus une fois par jour).
+    pub auto_update: bool,
+    pub last_update_check: i64,
     /// Dernier plantage déjà signalé (secondes Unix).
     pub crash_seen: i64,
 }
@@ -68,6 +71,8 @@ impl Default for Settings {
             folder_sizes: true,
             use_viewer: true,
             global_index: true,
+            auto_update: true,
+            last_update_check: 0,
             crash_seen: 0,
         }
     }
@@ -322,6 +327,13 @@ pub enum Action {
     NativeMenu(Vec<PathBuf>),
     OpenInViewer(Vec<PathBuf>),
     Convert(String, Vec<PathBuf>),
+    CheckUpdate,
+    InstallUpdate,
+}
+
+pub enum UpdateMsg {
+    Checked { manual: bool, res: Result<Option<crate::updater::Release>, String> },
+    Installed(Result<(), String>),
 }
 
 /// État de la palette « Aller à » (Ctrl+P).
@@ -402,6 +414,11 @@ pub struct App {
     /// Exe du lecteur universel, s'il est installé.
     pub viewer: Option<PathBuf>,
     pub index: Option<crate::index::Index>,
+    /// Mise à jour disponible (bandeau dans la barre d'état).
+    pub update: Option<crate::updater::Release>,
+    pub update_busy: Option<&'static str>,
+    update_tx: Sender<UpdateMsg>,
+    update_rx: Receiver<UpdateMsg>,
     /// Dossiers demandés par une autre instance (boîte aux lettres).
     inbox_rx: Receiver<String>,
     pub bring_front: bool,
@@ -493,6 +510,7 @@ impl App {
             }
         });
 
+        let (utx, urx) = unbounded();
         let mut app = App {
             drag_out: None,
             native_menu: None,
@@ -506,6 +524,10 @@ impl App {
             batch: None,
             viewer: crate::viewer::find(),
             index: None,
+            update: None,
+            update_busy: None,
+            update_tx: utx,
+            update_rx: urx,
             inbox_rx,
             bring_front: false,
             #[cfg(windows)]
@@ -561,6 +583,10 @@ impl App {
         app.active = app.s.active.min(app.tabs.len() - 1);
         if app.s.global_index {
             app.index = Some(crate::index::Index::start(&ctx));
+        }
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        if app.s.auto_update && now - app.s.last_update_check > 24 * 3600 {
+            app.start_update_check(false);
         }
         // Plantage depuis la dernière fois ? On le signale une fois.
         if let Some(log) = dirs::config_dir().map(|d| d.join("Explorateur").join("crash.log")) {
@@ -1158,6 +1184,7 @@ impl App {
 
     /// Appelé à chaque image, avant le dessin.
     pub fn tick(&mut self) {
+        self.process_updates();
         while let Ok(req) = self.inbox_rx.try_recv() {
             let p = PathBuf::from(req.trim());
             let p = if p.is_dir() { p } else { dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\")) };
@@ -1903,6 +1930,18 @@ impl App {
                 }
             }
             Action::NativeMenu(v) => self.native_menu = Some(v),
+            Action::CheckUpdate => self.start_update_check(true),
+            Action::InstallUpdate => {
+                if let Some(r) = self.update.clone() {
+                    self.update_busy = Some("Téléchargement de la mise à jour…");
+                    let (tx, ctx) = (self.update_tx.clone(), self.ctx.clone());
+                    std::thread::spawn(move || {
+                        let res = crate::updater::install(&r);
+                        let _ = tx.send(UpdateMsg::Installed(res));
+                        ctx.request_repaint();
+                    });
+                }
+            }
             Action::OpenInViewer(v) => match &self.viewer {
                 Some(exe) => {
                     crate::viewer::open(exe, &v);
@@ -1943,6 +1982,37 @@ impl App {
             self.toast("L’Explorateur Windows est de nouveau l’explorateur par défaut", false);
         }
         self.is_default = winx::default_explorer::is_enabled();
+    }
+
+    pub fn start_update_check(&mut self, manual: bool) {
+        self.s.last_update_check = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        self.update_busy = Some("Recherche de mise à jour…");
+        let (tx, ctx) = (self.update_tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let res = crate::updater::check();
+            let _ = tx.send(UpdateMsg::Checked { manual, res });
+            ctx.request_repaint();
+        });
+    }
+
+    fn process_updates(&mut self) {
+        while let Ok(m) = self.update_rx.try_recv() {
+            self.update_busy = None;
+            match m {
+                UpdateMsg::Checked { manual, res } => match res {
+                    Ok(Some(r)) => self.update = Some(r),
+                    Ok(None) if manual => self.toast(format!("Tu as la dernière version ({})", env!("CARGO_PKG_VERSION")), false),
+                    Err(e) if manual => self.toast(format!("Vérification impossible : {e}"), true),
+                    _ => {}
+                },
+                UpdateMsg::Installed(Ok(())) => {
+                    // La nouvelle version est lancée : on enregistre et on s'arrête.
+                    self.settings_for_save().clone().save();
+                    std::process::exit(0);
+                }
+                UpdateMsg::Installed(Err(e)) => self.toast(format!("Mise à jour impossible : {e}"), true),
+            }
+        }
     }
 
     pub fn cancel_ops(&self) {

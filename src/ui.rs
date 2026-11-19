@@ -341,6 +341,12 @@ impl App {
                 self.actions.push(if pinned { Action::Unpin(cur.clone()) } else { Action::Pin(cur.clone()) });
                 ui.close();
             }
+            ui.separator();
+            ui.checkbox(&mut self.s.auto_update, "Chercher les mises à jour automatiquement");
+            if ui.button(format!("Vérifier les mises à jour (v{})", env!("CARGO_PKG_VERSION"))).clicked() {
+                self.actions.push(Action::CheckUpdate);
+                ui.close();
+            }
             if ui.button("Raccourcis clavier (F1)").clicked() {
                 self.show_help = true;
                 ui.close();
@@ -615,6 +621,21 @@ impl App {
                     }
                     if let Some((msg, _, err)) = &self.toast {
                         ui.label(RichText::new(msg).color(if *err { p.del } else { p.text }).size(12.0));
+                    }
+                    if let Some(busy) = self.update_busy {
+                        ui.label(RichText::new(busy).color(p.muted).size(12.0));
+                    } else if let Some(r) = &self.update {
+                        let txt = format!("⬆ Mise à jour {} disponible — Installer", r.tag);
+                        if ui
+                            .add(egui::Button::new(RichText::new(txt).color(p.on_accent).size(12.0)).fill(p.accent))
+                            .on_hover_text("Télécharge la nouvelle version depuis GitHub, remplace l’app et la relance")
+                            .clicked()
+                        {
+                            self.actions.push(Action::InstallUpdate);
+                        }
+                        if ui.add(egui::Button::new(RichText::new("nouveautés").size(12.0).underline()).frame(false)).clicked() {
+                            let _ = open::that_detached(&r.page);
+                        }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let t = self.tab();
