@@ -122,7 +122,7 @@ impl Runner {
         }
 
         // Un dossier ouvert depuis ailleurs (Win+E, Bureau…) : on passe au premier plan.
-        if std::mem::take(&mut app.bring_front) {
+        if std::mem::take(&mut app.bring_front) && !socle::testmode::enabled() {
             gfx.window.set_minimized(false);
             gfx.window.focus_window();
         }
@@ -151,7 +151,19 @@ impl ApplicationHandler<UserEvent> for Runner {
             .with_inner_size(LogicalSize::new(w.max(760.0), h.max(480.0)))
             .with_min_inner_size(LogicalSize::new(760.0, 480.0))
             .with_window_icon(window_icon());
+        // Mode test (règle n° 0) : fenêtre créée invisible et sans focus, puis rendue transparente.
+        let test = socle::testmode::enabled();
+        let attrs = if test { attrs.with_visible(false).with_active(false) } else { attrs };
         let window = Rc::new(el.create_window(attrs).expect("création de la fenêtre"));
+        #[cfg(windows)]
+        if test {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(h) = window.window_handle() {
+                if let RawWindowHandle::Win32(w) = h.as_raw() {
+                    socle::testmode::hide(w.hwnd.get());
+                }
+            }
+        }
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer");
         let surface = softbuffer::Surface::new(&context, window.clone()).expect("surface");
         let egui = egui_winit::State::new(
@@ -235,7 +247,10 @@ fn window_icon() -> Option<winit::window::Icon> {
 
 fn main() {
     // Journal de plantage (%APPDATA%\Explorateur\crash.log) et nettoyage d'une mise à jour.
-    socle::crash::install(app::APP, env!("CARGO_PKG_VERSION"));
+    if socle::testmode::enabled() {
+        socle::testmode::low_priority();
+    }
+    socle::crash::install(app::app_name(), env!("CARGO_PKG_VERSION"));
     socle::update::cleanup_old();
     // Relancé par une mise à jour : l'ancienne instance est en train de se fermer.
     let after_update = socle::update::is_after_update();
@@ -247,7 +262,7 @@ fn main() {
         std::env::args().skip(1).filter(|a| !a.starts_with("--")).take(1).filter(|a| std::path::Path::new(a).is_dir()).collect();
     // (après une mise à jour, l'ancienne fenêtre a eu 0,8 s pour se fermer et rendre le mutex)
     let mut instance = None;
-    match socle::instance::start(app::APP, &dir_arg) {
+    match socle::instance::start(app::app_name(), &dir_arg) {
         socle::instance::Start::Forwarded if !after_update => return,
         socle::instance::Start::Primary(i) => instance = Some(i),
         _ => {}

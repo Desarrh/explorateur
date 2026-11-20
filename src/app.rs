@@ -457,6 +457,17 @@ pub struct App {
 /// Nom de l'app pour le socle (dossiers %APPDATA% / %LOCALAPPDATA%, tube, mutex).
 pub const APP: &str = "Explorateur";
 
+/// Nom utilisé en mode test (`--test-hors-ecran` / `SOCLE_TEST=1`) : autre mutex, autre tube,
+/// autre cache ; jamais l'instance ni les réglages de l'utilisateur.
+pub fn app_name() -> &'static str {
+    if socle::testmode::enabled() { "ExplorateurTest" } else { APP }
+}
+
+/// En mode test, réglages dans un dossier temporaire.
+fn test_settings_path() -> Option<std::path::PathBuf> {
+    socle::testmode::enabled().then(|| std::env::temp_dir().join("explorateur-test").join("settings.json"))
+}
+
 /// Mise à jour depuis les releases GitHub (socle::update).
 pub const UPDATER: socle::update::Updater =
     socle::update::Updater { repo: "Desarrh/explorateur", current: env!("CARGO_PKG_VERSION"), asset_suffix: "windows-x64.zip", exe_name: None };
@@ -464,10 +475,20 @@ pub const UPDATER: socle::update::Updater =
 impl Settings {
     /// `%APPDATA%\Explorateur\settings.json` (socle : même fichier qu'avant, écriture atomique).
     pub fn load() -> Settings {
-        socle::settings::load(APP)
+        match test_settings_path() {
+            Some(p) => {
+                let mut s: Settings = socle::settings::load_from(&p);
+                s.auto_update = false;
+                s
+            }
+            None => socle::settings::load(APP),
+        }
     }
     pub fn save(&self) {
-        let _ = socle::settings::save(APP, self);
+        let _ = match test_settings_path() {
+            Some(p) => socle::settings::save_to(&p, self),
+            None => socle::settings::save(APP, self),
+        };
     }
 }
 
@@ -631,7 +652,7 @@ impl App {
             app.start_update_check(false);
         }
         // Plantage depuis la dernière fois ? On le signale une fois (socle::crash).
-        if let Some(msg) = socle::crash::pending(APP) {
+        if let Some(msg) = socle::crash::pending(app_name()) {
             app.toast(format!("L’explorateur s’est fermé brutalement la dernière fois ({msg}) — détails : {}", socle::crash::log_path(APP).display()), true);
         }
         app

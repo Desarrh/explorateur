@@ -28,7 +28,7 @@ impl Thumbs {
     pub fn new(ctx: &egui::Context) -> Self {
         let (tx, req_rx) = unbounded::<Key>();
         let (res_tx, rx) = unbounded();
-        let disk = socle::images::DiskCache::for_app(crate::app::APP);
+        let disk = socle::images::DiskCache::for_app(crate::app::app_name());
         // Ménage du cache disque (500 Mo max), sans retarder le démarrage.
         let d2 = disk.clone();
         std::thread::spawn(move || {
