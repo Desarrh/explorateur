@@ -29,8 +29,9 @@ All numbers measured on the author's machine (Windows 11, NVMe SSD, 5120×1440 d
 
 | | |
 |---|---|
-| Executable | ~11 MB, single file |
-| Memory, normal use | **~40–45 MB** |
+| Executable | ~14 MB, single file |
+| Memory, normal use | **~40–45 MB** (30 MB private in the headless 10,000-file benchmark) |
+| Show a 10,000-file folder | ~40–60 ms to the first full frame, 2–4 ms per frame afterwards |
 | Memory with the global search index (~2 M files) | ~160 MB right after the first scan (~80 MB of index) — can be turned off |
 | Open `C:\Windows\System32` (5,944 entries) | ~8 ms |
 | Global search over 1.97 M file names | **~5 ms per keystroke** |
@@ -62,8 +63,10 @@ All numbers measured on the author's machine (Windows 11, NVMe SSD, 5120×1440 d
   lowercase arena (~40 bytes per file), searched with a single `memmem` pass; the real file-name case is
   read back only for the handful of results shown. (Everything stays live by reading the NTFS USN journal
   from an admin service; here the index is rebuilt at startup and every 20 minutes.)
-- **Thumbnails** are decoded on 2–4 worker threads: images with Rust decoders, videos / PDF / Office / PSD /
-  HEIC / album art through the Windows thumbnail provider (`IShellItemImageFactory`), like Explorer.
+- **Thumbnails** are decoded on 2–4 worker threads: almost every image format (PNG, JPEG, WebP, AVIF, TIFF,
+  SVG, PSD, HEIC/RAW through WIC…) with an on-disk QOI cache so the second visit is instant; videos / PDF /
+  Office / album art through the Windows thumbnail provider (`IShellItemImageFactory`), like Explorer.
+- **Only the Segoe UI fonts that are needed** are loaded: vector icons instead of the 13 MB emoji font.
 - **Everything blocking runs off the UI thread**: directory loads, copies/moves, git, zip, thumbnails, search.
 
 ## Features
@@ -74,7 +77,12 @@ All numbers measured on the author's machine (Windows 11, NVMe SSD, 5120×1440 d
 - Full-screen preview with <kbd>Space</kbd>, arrow keys to flip through files
 - Dual pane (<kbd>F3</kbd>), <kbd>F6</kbd> / <kbd>Shift</kbd>+<kbd>F6</kbd> copy / move to the other pane
 - Go to (<kbd>Ctrl</kbd>+<kbd>P</kbd>): fuzzy search over your frequent/recent folders **and every file on your drives**
-- Fuzzy filter in the current folder, or recursive search that respects `.gitignore`
+- Fuzzy filter in the current folder (with history autocomplete), or recursive search that respects `.gitignore`
+- Address bar autocomplete (sub-folders and frequent folders); command palette <kbd>Ctrl</kbd>+<kbd>K</kbd> with every action
+- **Recent files everywhere**: a *Récents* tab listing the files just modified on all your drives (exports,
+  captures, downloads), live, skipping AppData, Program Files, hidden and build folders
+- **Disk-space map** (<kbd>Ctrl</kbd>+<kbd>3</kbd>), WizTree-style: the folder as nested rectangles sized by what they take,
+  colored by type; click to dive in, right-click to open, show or send to the recycle bin
 - Type-ahead, hidden files toggle, cream light theme / navy dark theme
 
 **File operations**
@@ -88,12 +96,15 @@ All numbers measured on the author's machine (Windows 11, NVMe SSD, 5120×1440 d
 **Dev view** (switch with the Bureau / Dev toggle)
 - Git changes with +/− line counts, checkboxes to pick what goes into the commit, diff of the selected file
 - Commit (<kbd>Ctrl</kbd>+<kbd>Enter</kbd>), push, restore a file
-- Live activity feed: every file created / modified / deleted, bursts grouped, git-ignored files hidden
+- Live activity feed: every file created / modified / deleted, git-ignored files hidden
+- **Agent passes**: changes made in a row (by an AI agent, a build…) are grouped into passes; see the combined
+  diff of a pass, **undo the whole pass** (files back to how they were before it) and redo it. Uses git snapshots
+  through a temporary index: your index, branch and history are never touched.
 
 **Windows integration**
 - Can become the default file explorer (`⋯` menu): <kbd>Win</kbd>+<kbd>E</kbd> and folders opened from the desktop
   or other apps open here, as a new tab of the running window. Only per-user registry keys, fully reversible.
-- Single window: launching it again opens a tab in the existing window
+- Single window: launching it again opens a tab in the existing window (named pipe, < 1 ms, no polling)
 - Pairs with [Lecteur universel](https://github.com/Desarrh/lecteur-universel): double-click media and documents to open them
   there, right-click → *Convertir en…* to convert (PNG, WEBP, PDF, MP3, GIF…)
 - Crash log in `%APPDATA%\Explorateur\crash.log`, reported on next launch
@@ -111,8 +122,11 @@ cargo build --release        # target\release\explorateur.exe
 cargo test --release         # unit tests
 ```
 
-`scripts\maj.ps1` builds, closes the running app, replaces `dist\Explorateur.exe` and restarts it.
-Benchmarks: `cargo test --release bench_taille -- --ignored --nocapture` and `bench_index`.
+`scripts\maj.ps1` builds at low priority and replaces `dist\Explorateur.exe` (the running window keeps the old
+version until it closes; `-Relancer` restarts it).
+Benchmarks: `cargo test --release bench_affichage -- --ignored --nocapture`, `bench_taille` and `bench_index`.
+Shared code (theme, icons, widgets, image decoders, settings, single instance, self-update) comes from
+[socle](https://github.com/Desarrh/socle).
 
 | File | Role |
 |---|---|
@@ -120,18 +134,22 @@ Benchmarks: `cargo test --release bench_taille -- --ignored --nocapture` and `be
 | `src/app.rs` | State, tabs, selection, live watching, actions |
 | `src/ui.rs` | Interface (virtualized list and grid, panes, menus) |
 | `src/extras.rs` | Go-to palette, full-screen preview, batch rename |
+| `src/commands.rs` | Command palette (<kbd>Ctrl</kbd>+<kbd>K</kbd>) and shortcut help |
 | `src/sizes.rs` | Parallel folder sizes |
-| `src/index.rs` | Global file-name index |
-| `src/thumbs.rs` | Thumbnails (Rust decoders + Windows thumbnail provider) |
+| `src/spacemap.rs` | Disk-space map (squarified treemap) |
+| `src/index.rs` | Global file-name index (with modification dates) |
+| `src/recents.rs` | Recent files on all drives |
+| `src/bursts.rs` | Agent passes (grouping, snapshots) |
+| `src/thumbs.rs` | Thumbnails (socle decoders + disk cache, Windows thumbnail provider) |
 | `src/ops.rs` | File operation queue with undo |
-| `src/git.rs` | Git status, diff, commit, push |
-| `src/winx.rs` | Windows clipboard, shell menu, default explorer, single instance |
-| `src/updater.rs` | Self-update from GitHub releases |
+| `src/git.rs` | Git status, diff, commit, push, pass snapshots |
+| `src/winx.rs` | Windows clipboard, drag out, shell menu, default explorer |
 
 ## Known limitations
 
 - Windows only.
-- The global index is not live: a file created in the last 20 minutes may be missing from <kbd>Ctrl</kbd>+<kbd>P</kbd>.
+- The global index is rebuilt every 20 minutes: a file created since may be missing from <kbd>Ctrl</kbd>+<kbd>P</kbd>
+  (the *Récents* tab, on the other hand, is live).
 - No built-in video playback (the preview shows a frame; click to play in your player or in Lecteur universel).
 - The desktop and taskbar stay Windows Explorer's.
 

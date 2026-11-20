@@ -171,6 +171,13 @@ installateur. `Explorateur.exe [dossier]`. Une 2ᵉ instance transmet le dossier
 fois par 24 h, asset `*windows-x64.zip`, l'exe en cours est renommé `.old`, le nouveau le remplace, relance
 avec `--apres-maj` (la nouvelle instance attend 0,8 s que l'ancienne rende le mutex). En dev : `scripts\maj.ps1`.
 
+**Conteneur MSIX** : tout ce que lance l'app Claude (commandes, `maj.ps1`) écrit ses nouveaux fichiers
+d'AppData dans `%LOCALAPPDATA%\Packages\Claude_…\LocalCache`, invisible pour l'utilisateur, et son registre
+HKCU est aussi virtualisé. Donc : relancer l'explorateur via `explorer.exe "<exe>"` (`maj.ps1 -Relancer` le
+fait), sauvegardes et fichiers de test sous `C:\Dev`. `winx::virtualized()` le détecte (fichier sonde) ; le
+réglage « explorateur par défaut » refuse alors d'écrire. Pour lire ou réparer les vraies données depuis une
+session Claude : petit exe sans fenêtre lancé par `explorer.exe` (voir `target\horsboite`, non versionné).
+
 **Mode test (règle n° 0)** : `--test-hors-ecran` ou `SOCLE_TEST=1` → fenêtre invisible et sans focus
 (`socle::testmode::hide`), priorité basse, nom d'app `ExplorateurTest` (mutex, tube, cache, journal à part),
 réglages dans `%TEMP%\explorateur-test\`. Les tests visuels se font **sans fenêtre** : `tests::capture_png`
@@ -193,8 +200,9 @@ les commits. Dépôt public `Desarrh/explorateur`.
 - Ctrl+P : dossiers fréquents/récents + index de tous les fichiers des disques (~2 M noms, ~5 ms).
 - Taille des dossiers en arrière-plan (parallèle, cache).
 - Double volet, renommage en lot (motifs, regex, aperçu des conflits).
-- Aperçu rapide (Espace, T3) : chemin écrit dans le tube `\\.\pipe\lecteur-universel-apercu-v1` si l'instance d'aperçu du lecteur est en veille (sinon `lecteur-universel --apercu <fichier>`), si le lecteur est là et gère le type ;
-  sinon, ou s'il échoue / sort en erreur dans la seconde, aperçu plein écran intégré (← → pour naviguer), sans erreur.
+- Aperçu rapide (Espace, T3) : `lecteur-universel --apercu <fichier>`, qui transmet lui-même à son aperçu déjà
+  ouvert (instance unique du socle) ; si le lecteur manque, échoue ou sort en erreur dans la seconde, aperçu plein
+  écran intégré (← → pour naviguer), sans erreur. On ne parle jamais directement au tube du lecteur.
 - Copier/couper/coller compatible Explorateur, glisser-déposer entrant et **sortant** (Bureau, Discord…).
 - Annulation (copie, déplacement, renommage, création, corbeille, zip, conversion).
 - Zip / dézip, nouveau dossier/fichier, corbeille / suppression définitive, propriétés, ouvrir avec.
