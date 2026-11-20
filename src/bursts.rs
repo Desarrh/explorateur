@@ -3,7 +3,7 @@
 //! (arbres écrits avec un index temporaire, sans toucher à l'index, à la branche ni à l'historique),
 //! ce qui donne son diff cumulé exact et une restauration en bloc réversible.
 use crate::app::Act;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -63,9 +63,18 @@ pub struct Bursts {
     /// Dernier instantané connu de chaque dépôt (base de la passe suivante).
     snaps: HashMap<PathBuf, String>,
     /// Instantané de base déjà demandé.
-    asked: std::collections::HashSet<PathBuf>,
+    asked: HashSet<PathBuf>,
+    /// Dépôts dont un instantané (base, clôture, restauration) est en cours : une passe qui démarre
+    /// pendant ce temps attend le résultat pour connaître son « avant ».
+    pending: HashSet<PathBuf>,
+    /// Dépôts où l'instantané de base a échoué : passes sans diff ni annulation.
+    failed: HashSet<PathBuf>,
+    /// Chemins copiés tels quels dans les instantanés de chaque dépôt (restaurés tels quels).
+    raw: HashMap<PathBuf, HashSet<String>>,
+    /// Fin de ligne réelle des fichiers suivis à l'instantané de base (voir `git::Snap::eol`).
+    eol: HashMap<PathBuf, HashMap<String, bool>>,
     /// Fichiers réécrits par une restauration : leurs événements ne forment pas une nouvelle passe.
-    muted: HashMap<PathBuf, (std::collections::HashSet<String>, Instant)>,
+    muted: HashMap<PathBuf, (HashSet<String>, Instant)>,
     next_id: u64,
 }
 
@@ -75,6 +84,7 @@ impl Bursts {
         if !self.asked.insert(root.to_path_buf()) {
             return None;
         }
+        self.pending.insert(root.to_path_buf());
         Some(SnapRequest { root: root.to_path_buf(), base: None, files: vec![], why: SnapWhy::Base })
     }
 
@@ -82,7 +92,8 @@ impl Bursts {
     pub fn record(&mut self, root: &Path, rel: String, act: Act) {
         let now = Instant::now();
         if let Some((files, until)) = self.muted.get(root) {
-            if now < *until && files.contains(&rel) {
+            // (un dossier restauré : ses fichiers aussi)
+            if now < *until && (files.contains(&rel) || files.iter().any(|f| rel.starts_with(&format!("{f}/")))) {
                 return;
             }
         }
@@ -91,7 +102,8 @@ impl Bursts {
             Some(b) => b,
             None => {
                 self.next_id += 1;
-                let before = self.snaps.get(root).cloned();
+                // Instantané en cours : l'« avant » sera le résultat attendu, pas l'ancien.
+                let before = if self.pending.contains(root) { None } else { self.snaps.get(root).cloned() };
                 self.list.push_front(Burst {
                     id: self.next_id,
                     root: root.to_path_buf(),
@@ -141,15 +153,19 @@ impl Bursts {
     pub fn tick(&mut self) -> Vec<SnapRequest> {
         let mut out = Vec::new();
         for b in self.list.iter_mut().filter(|b| b.open() && b.last.elapsed() >= QUIET) {
+            if b.before.is_none() {
+                if self.pending.contains(&b.root) && !self.failed.contains(&b.root) {
+                    continue; // son « avant » arrive : on clôt au prochain tour
+                }
+                b.before = self.snaps.get(&b.root).cloned();
+            }
             b.closed = true;
             if b.files.is_empty() {
                 continue;
             }
-            if b.before.is_none() {
-                b.before = self.snaps.get(&b.root).cloned();
-            }
             if let Some(base) = b.before.clone() {
                 b.busy = true;
+                self.pending.insert(b.root.clone());
                 out.push(SnapRequest { root: b.root.clone(), base: Some(base), files: b.files.keys().cloned().collect(), why: SnapWhy::Close(b.id) });
             }
         }
@@ -163,31 +179,44 @@ impl Bursts {
         self.list.iter().filter(|b| b.open()).map(|b| QUIET.saturating_sub(b.last.elapsed())).min()
     }
 
-    /// Réponse du thread git à un instantané.
-    pub fn on_snapshot(&mut self, root: &Path, why: SnapWhy, tree: Result<String, String>, skipped: Vec<String>) {
-        let Ok(tree) = tree else {
-            if let SnapWhy::Close(id) = why {
-                if let Some(b) = self.get_mut(id) {
-                    b.busy = false;
-                }
+    /// Réponse du thread git à un instantané. Renvoie un nouvel instantané de base à demander si
+    /// la chaîne est cassée (clôture en échec).
+    pub fn on_snapshot(&mut self, root: &Path, why: SnapWhy, res: Result<crate::git::Snap, String>) -> Option<SnapRequest> {
+        self.pending.remove(root);
+        let snap = match res {
+            Ok(s) => s,
+            Err(_) => {
+                return match why {
+                    SnapWhy::Base => {
+                        self.failed.insert(root.to_path_buf());
+                        None
+                    }
+                    SnapWhy::Close(id) => {
+                        if let Some(b) = self.get_mut(id) {
+                            b.busy = false;
+                        }
+                        // On repart d'un état du disque frais pour les passes suivantes.
+                        self.snaps.remove(root);
+                        self.pending.insert(root.to_path_buf());
+                        Some(SnapRequest { root: root.to_path_buf(), base: None, files: vec![], why: SnapWhy::Base })
+                    }
+                };
             }
-            return;
         };
-        self.snaps.insert(root.to_path_buf(), tree.clone());
-        match why {
-            SnapWhy::Base => {
-                for b in self.list.iter_mut().filter(|b| b.root == root && b.before.is_none()) {
-                    b.before = Some(tree.clone());
-                }
-            }
-            SnapWhy::Close(id) => {
-                if let Some(b) = self.get_mut(id) {
-                    b.after = Some(tree);
-                    b.skipped = skipped;
-                    b.busy = false;
-                }
+        self.failed.remove(root);
+        self.raw.entry(root.to_path_buf()).or_default().extend(snap.raw);
+        if matches!(why, SnapWhy::Base) {
+            self.eol.insert(root.to_path_buf(), snap.eol.into_iter().collect());
+        }
+        if let SnapWhy::Close(id) = why {
+            if let Some(b) = self.get_mut(id) {
+                b.after = Some(snap.tree.clone());
+                b.skipped = snap.skipped;
+                b.busy = false;
             }
         }
+        self.set_snapshot(root, snap.tree);
+        None
     }
 
     pub fn get(&self, id: u64) -> Option<&Burst> {
@@ -197,9 +226,32 @@ impl Bursts {
         self.list.iter_mut().find(|b| b.id == id)
     }
 
-    /// Après une restauration, l'état du disque a changé : la passe suivante partira de là.
+    /// Nouvel état connu du dépôt : base de la passe suivante, et « avant » des passes qui
+    /// attendaient (commencées pendant l'instantané).
     pub fn set_snapshot(&mut self, root: &Path, tree: String) {
+        for b in self.list.iter_mut().filter(|b| b.root == root && b.before.is_none()) {
+            b.before = Some(tree.clone());
+        }
         self.snaps.insert(root.to_path_buf(), tree);
+        self.pending.remove(root);
+    }
+
+    /// Une restauration commence : les passes qui démarrent attendent son résultat.
+    pub fn hold(&mut self, root: &Path) {
+        self.pending.insert(root.to_path_buf());
+    }
+
+    /// Ajoute des chemins copiés tels quels (instantanés pris pendant une restauration).
+    pub fn add_raw(&mut self, root: &Path, raw: Vec<String>) {
+        self.raw.entry(root.to_path_buf()).or_default().extend(raw);
+    }
+
+    pub fn eol_of(&self, root: &Path) -> HashMap<String, bool> {
+        self.eol.get(root).cloned().unwrap_or_default()
+    }
+
+    pub fn raw_of(&self, root: &Path) -> HashSet<String> {
+        self.raw.get(root).cloned().unwrap_or_default()
     }
 
     /// Ignore les événements de ces fichiers pendant 3 s (réécrits par une restauration).

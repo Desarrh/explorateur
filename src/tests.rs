@@ -370,6 +370,8 @@ fn git_t(dir: &std::path::Path, args: &[&str]) -> String {
 #[test]
 fn rafale_instantanes_diff_restauration() {
     use crate::git::{burst_restore, snapshot};
+    let mut raw = std::collections::HashSet::new();
+    let mut eol = std::collections::HashMap::new();
     let d = tmpdir("rafale");
     git_t(&d, &["init", "-q"]);
     std::fs::write(d.join("a.txt"), "v1\n").unwrap();
@@ -378,7 +380,10 @@ fn rafale_instantanes_diff_restauration() {
     git_t(&d, &["commit", "-q", "-m", "init"]);
     // Changement non commité AVANT la passe : il doit survivre à l'annulation de la passe.
     std::fs::write(d.join("a.txt"), "v2\n").unwrap();
-    let (base, _) = snapshot(&d, None, &[]).expect("instantané de base");
+    let s0 = snapshot(&d, None, &[]).expect("instantané de base");
+    raw.extend(s0.raw);
+    eol.extend(s0.eol);
+    let base = s0.tree;
     let index_avant = git_t(&d, &["diff", "--cached", "--stat"]);
 
     // La passe : a modifié, b créé, c supprimé.
@@ -386,7 +391,9 @@ fn rafale_instantanes_diff_restauration() {
     std::fs::write(d.join("b.txt"), "nouveau\n").unwrap();
     std::fs::remove_file(d.join("c.txt")).unwrap();
     let files: Vec<String> = ["a.txt", "b.txt", "c.txt"].iter().map(|s| s.to_string()).collect();
-    let (after, skipped) = snapshot(&d, Some(&base), &files).expect("instantané de fin");
+    let s1 = snapshot(&d, Some(&base), &files).expect("instantané de fin");
+    raw.extend(s1.raw);
+    let (after, skipped) = (s1.tree, s1.skipped);
     assert!(skipped.is_empty());
     let diff = git_t(&d, &["diff", &base, &after]);
     assert!(diff.contains("-v2") && diff.contains("+v3"), "{diff}");
@@ -395,12 +402,15 @@ fn rafale_instantanes_diff_restauration() {
     assert_eq!(lines.iter().filter(|l| l.kind == crate::git::LineKind::File).count(), 3);
 
     // Annuler la passe : retour à l'état d'avant la passe (v2, pas le commit v1).
-    let (undo, post) = burst_restore(&d, &base, &after, &files).expect("restauration");
+    let r = burst_restore(&d, &base, &after, &files, &["b.txt".to_string()], &raw, &eol).expect("restauration");
+    raw.extend(r.raw.clone());
+    let (undo, post, kept) = (r.undo, r.post, r.kept);
+    assert_eq!(kept, 0);
     assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap().trim(), "v2");
     assert!(!d.join("b.txt").exists());
     assert_eq!(std::fs::read_to_string(d.join("c.txt")).unwrap().trim(), "garde");
     // Rétablir.
-    burst_restore(&d, &undo, &post, &files).expect("rétablir");
+    burst_restore(&d, &undo, &post, &files, &["c.txt".to_string()], &raw, &eol).expect("rétablir");
     assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap().trim(), "v3");
     assert_eq!(std::fs::read_to_string(d.join("b.txt")).unwrap().trim(), "nouveau");
     assert!(!d.join("c.txt").exists());
@@ -741,4 +751,126 @@ fn capture_carte() {
 #[test]
 fn diagnostic_conteneur() {
     println!("écritures virtualisées (conteneur MSIX) : {}", crate::winx::virtualized());
+}
+
+/// Audit n° 1 : un fichier non suivi qui existait avant la passe, modifié par l'agent, doit
+/// revenir à son contenu d'avant à l'annulation (et surtout pas partir à la corbeille).
+#[test]
+fn rafale_non_suivi_existant_restaure() {
+    use crate::git::{burst_restore, snapshot};
+    let mut raw = std::collections::HashSet::new();
+    let mut eol = std::collections::HashMap::new();
+    let d = tmpdir("rafale-non-suivi");
+    git_t(&d, &["init", "-q"]);
+    std::fs::write(d.join("a.txt"), "a\n").unwrap();
+    git_t(&d, &["add", "-A"]);
+    git_t(&d, &["commit", "-q", "-m", "init"]);
+    std::fs::write(d.join("notes.md"), "mes notes\n").unwrap(); // jamais commité
+    let s0 = snapshot(&d, None, &[]).unwrap();
+    raw.extend(s0.raw);
+    eol.extend(s0.eol);
+    let base = s0.tree;
+    std::fs::write(d.join("notes.md"), "réécrit par l'agent\n").unwrap();
+    let files = vec!["notes.md".to_string()];
+    let s1 = snapshot(&d, Some(&base), &files).unwrap();
+    raw.extend(s1.raw);
+    let after = s1.tree;
+    burst_restore(&d, &base, &after, &files, &[], &raw, &eol).expect("annulation");
+    assert_eq!(std::fs::read_to_string(d.join("notes.md")).ok().as_deref(), Some("mes notes\n"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Audit n° 2 : annuler une passe qui a supprimé un dossier le remet, sans le jeter ensuite.
+#[test]
+fn rafale_dossier_supprime_restaure() {
+    use crate::git::{burst_restore, snapshot};
+    let mut raw = std::collections::HashSet::new();
+    let mut eol = std::collections::HashMap::new();
+    for files in [vec!["dossier"], vec!["dossier", "dossier/a.txt", "dossier/b.txt"]] {
+        let d = tmpdir("rafale-dossier");
+        git_t(&d, &["init", "-q"]);
+        std::fs::create_dir_all(d.join("dossier")).unwrap();
+        std::fs::write(d.join("dossier").join("a.txt"), "a\n").unwrap();
+        std::fs::write(d.join("dossier").join("b.txt"), "b\n").unwrap();
+        git_t(&d, &["add", "-A"]);
+        git_t(&d, &["commit", "-q", "-m", "init"]);
+        let s0 = snapshot(&d, None, &[]).unwrap();
+    raw.extend(s0.raw);
+    eol.extend(s0.eol);
+    let base = s0.tree;
+        std::fs::remove_dir_all(d.join("dossier")).unwrap();
+        let files: Vec<String> = files.iter().map(|s| s.to_string()).collect();
+        let s1 = snapshot(&d, Some(&base), &files).unwrap();
+    raw.extend(s1.raw);
+    let after = s1.tree;
+        let diff = git_t(&d, &["diff", "--stat", &base, &after]);
+        assert!(diff.contains("dossier/a.txt"), "la suppression du dossier est dans le diff : {diff}");
+        burst_restore(&d, &base, &after, &files, &[], &raw, &eol).expect("annulation");
+        assert_eq!(std::fs::read_to_string(d.join("dossier").join("a.txt")).ok().as_deref(), Some("a\n"), "{files:?}");
+        assert!(d.join("dossier").join("b.txt").exists(), "{files:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Audit n° 8 : un nom avec des caractères de motif ([ab].txt) ne touche que ce fichier.
+#[test]
+fn rafale_nom_avec_motif() {
+    use crate::git::{burst_restore, snapshot};
+    let mut raw = std::collections::HashSet::new();
+    let mut eol = std::collections::HashMap::new();
+    let d = tmpdir("rafale-motif");
+    git_t(&d, &["init", "-q"]);
+    for f in ["a.txt", "b.txt", "[ab].txt"] {
+        std::fs::write(d.join(f), "v1\n").unwrap();
+    }
+    git_t(&d, &["add", "-A"]);
+    git_t(&d, &["commit", "-q", "-m", "init"]);
+    let s0 = snapshot(&d, None, &[]).unwrap();
+    raw.extend(s0.raw);
+    eol.extend(s0.eol);
+    let base = s0.tree;
+    for f in ["a.txt", "b.txt", "[ab].txt"] {
+        std::fs::write(d.join(f), "v2\n").unwrap();
+    }
+    let files = vec!["[ab].txt".to_string()];
+    let s1 = snapshot(&d, Some(&base), &files).unwrap();
+    raw.extend(s1.raw);
+    let after = s1.tree;
+    burst_restore(&d, &base, &after, &files, &[], &raw, &eol).expect("annulation");
+    assert_eq!(std::fs::read_to_string(d.join("[ab].txt")).unwrap(), "v1\n");
+    assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "v2\n", "a.txt n'était pas dans la passe");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Audit n° 3 : une passe qui commence pendant la clôture de la précédente part de l'état
+/// d'après cette clôture, pas de l'ancien instantané.
+#[test]
+fn rafale_passe_pendant_cloture() {
+    use crate::app::Act;
+    use crate::bursts::{Bursts, SnapWhy, QUIET};
+    let snap = |t: &str| Ok(crate::git::Snap { tree: t.into(), skipped: vec![], raw: vec![], eol: vec![] });
+    let root = Path::new("C:/depot");
+    let mut b = Bursts::default();
+    assert!(b.watch_repo(root).is_some());
+    b.record(root, "tot.rs".into(), Act::Modified); // pendant l'instantané de base
+    assert_eq!(b.list[0].before, None);
+    assert!(b.on_snapshot(root, SnapWhy::Base, snap("T0")).is_none());
+    assert_eq!(b.list[0].before.as_deref(), Some("T0"), "rempli à l'arrivée de la base");
+    let first = b.list[0].id;
+    b.list[0].last -= QUIET;
+    let reqs = b.tick();
+    assert_eq!(reqs.len(), 1, "clôture demandée");
+    // Nouvelle écriture pendant que la clôture est calculée.
+    b.record(root, "suite.rs".into(), Act::Modified);
+    let second = b.list[0].id;
+    assert_ne!(first, second);
+    assert_eq!(b.get(second).unwrap().before, None, "attend l'état d'après la clôture");
+    b.get_mut(second).unwrap().last -= QUIET;
+    assert!(b.tick().is_empty(), "pas de clôture sans son « avant »");
+    b.on_snapshot(root, SnapWhy::Close(first), snap("T1"));
+    assert_eq!(b.get(first).unwrap().after.as_deref(), Some("T1"));
+    assert_eq!(b.get(second).unwrap().before.as_deref(), Some("T1"));
+    let reqs = b.tick();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].base.as_deref(), Some("T1"));
 }

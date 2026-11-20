@@ -1264,9 +1264,11 @@ impl App {
                         }
                     }
                 }
-                git::Resp::Snapshot { root, why, tree, skipped } => {
+                git::Resp::Snapshot { root, why, res } => {
                     let w = if why == 0 { crate::bursts::SnapWhy::Base } else { crate::bursts::SnapWhy::Close(why) };
-                    self.bursts.on_snapshot(&root, w, tree, skipped);
+                    if let Some(q) = self.bursts.on_snapshot(&root, w, res) {
+                        self.git.send(git::Req::Snapshot { root: q.root, base: q.base, files: q.files, why: 0 });
+                    }
                     if why != 0 && self.burst_view == Some(why) {
                         self.request_burst_diff(why);
                     }
@@ -1282,15 +1284,24 @@ impl App {
                         b.busy = false;
                     }
                     match res {
-                        Ok((undo, post)) => {
+                        Ok(r) => {
+                            let kept = r.kept;
                             if let Some(b) = self.bursts.get_mut(id) {
-                                b.undo = if redo { None } else { Some(undo) };
+                                b.undo = if redo { None } else { Some(r.undo) };
                             }
-                            self.bursts.set_snapshot(&root, post);
-                            let msg = if redo { format!("Passe rétablie ({n} fichier(s))") } else { format!("Passe annulée : {n} fichier(s) remis comme avant") };
+                            self.bursts.add_raw(&root, r.raw);
+                            self.bursts.set_snapshot(&root, r.post);
+                            let mut msg = if redo { format!("Passe rétablie ({n} fichier(s))") } else { format!("Passe annulée : {n} fichier(s) remis comme avant") };
+                            if kept > 0 {
+                                msg.push_str(&format!(" ; {kept} laissé(s) tel(s) quel(s) (état d’avant inconnu)"));
+                            }
                             self.toast(msg, false);
                         }
-                        Err(e) => self.toast(format!("Restauration de la passe impossible : {e}"), true),
+                        Err(e) => {
+                            // État du disque incertain : nouvel instantané de base.
+                            self.toast(format!("Restauration de la passe impossible : {e}"), true);
+                            self.git.send(git::Req::Snapshot { root: root.clone(), base: None, files: vec![], why: 0 });
+                        }
                     }
                     self.git.send(git::Req::Status(root));
                 }
@@ -2283,11 +2294,17 @@ impl App {
             return;
         };
         let (root, files) = (b.root.clone(), b.restorable());
+        // Seuls ces chemins peuvent partir à la corbeille : créés par la passe (on l'annule) ou
+        // supprimés par elle (on la rétablit). Un fichier dont on ignore l'état d'avant reste.
+        let gone = if redo { Act::Removed } else { Act::Created };
+        let may_remove: Vec<String> = b.files.iter().filter(|(_, a)| **a == gone).map(|(f, _)| f.clone()).collect();
+        let (raw, eol) = (self.bursts.raw_of(&root), self.bursts.eol_of(&root));
         self.bursts.mute(&root, &files);
+        self.bursts.hold(&root);
         if let Some(b) = self.bursts.get_mut(id) {
             b.busy = true;
         }
-        self.git.send(git::Req::BurstRestore { root, id, to, base, files, redo });
+        self.git.send(git::Req::BurstRestore { root, id, to, base, files, may_remove, raw, eol, redo });
     }
 
     #[cfg(windows)]

@@ -76,7 +76,19 @@ pub enum Req {
     Snapshot { root: PathBuf, base: Option<String>, files: Vec<String>, why: u64 },
     BurstDiff { root: PathBuf, id: u64, before: String, after: Option<String>, files: Vec<String> },
     /// Remet `files` dans l'état de l'arbre `to` (`base` = instantané courant du dépôt).
-    BurstRestore { root: PathBuf, id: u64, to: String, base: String, files: Vec<String>, redo: bool },
+    BurstRestore {
+        root: PathBuf,
+        id: u64,
+        to: String,
+        base: String,
+        files: Vec<String>,
+        may_remove: Vec<String>,
+        /// Chemins copiés tels quels dans les instantanés du dépôt.
+        raw: std::collections::HashSet<String>,
+        /// Fin de ligne d'origine des fichiers suivis (voir `Snap::eol`).
+        eol: HashMap<String, bool>,
+        redo: bool,
+    },
 }
 
 pub enum Resp {
@@ -84,10 +96,10 @@ pub enum Resp {
     Status { root: PathBuf, branch: String, ahead: String, changes: Vec<Change> },
     Diff { rel: String, lines: Vec<DiffLine> },
     Done { what: &'static str, ok: bool, msg: String, root: PathBuf },
-    Snapshot { root: PathBuf, why: u64, tree: Result<String, String>, skipped: Vec<String> },
+    Snapshot { root: PathBuf, why: u64, res: Result<Snap, String> },
     BurstDiff { id: u64, lines: Vec<DiffLine>, plus: u32, minus: u32 },
     /// `res` : (état d'avant la restauration, état d'après = base de la passe suivante).
-    BurstRestored { root: PathBuf, id: u64, redo: bool, res: Result<(String, String), String> },
+    BurstRestored { root: PathBuf, id: u64, redo: bool, res: Result<Restored, String> },
 }
 
 pub struct Git {
@@ -126,6 +138,8 @@ impl Git {
 fn git(root: &Path) -> Command {
     let mut c = Command::new("git");
     c.arg("-C").arg(root).args(["-c", "core.quotepath=off", "-c", "color.ui=false"]);
+    // Chemins toujours pris à la lettre : « [ab].txt » ne doit pas désigner a.txt et b.txt.
+    c.env("GIT_LITERAL_PATHSPECS", "1");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -211,22 +225,20 @@ fn handle(req: Req) -> Resp {
             done("git init", out(c), root)
         }
         Req::Snapshot { root, base, files, why } => {
-            let (tree, skipped) = match snapshot(&root, base.as_deref(), &files) {
-                Ok((t, s)) => (Ok(t), s),
-                Err(e) => (Err(e), vec![]),
-            };
-            Resp::Snapshot { root, why, tree, skipped }
+            let res = snapshot(&root, base.as_deref(), &files);
+            Resp::Snapshot { root, why, res }
         }
         Req::BurstDiff { root, id, before, after, files } => {
             let after = match after {
                 Some(a) => Ok(a),
-                None => snapshot(&root, Some(&before), &files).map(|x| x.0),
+                None => snapshot(&root, Some(&before), &files).map(|x| x.tree),
             };
             // `after` = `before` + les fichiers de la passe : le diff des deux arbres est celui de la passe.
             let text = after
                 .and_then(|a| {
                     let mut c = git(&root);
-                    c.args(["diff", "--no-color", &before, &a]);
+                    // (contenus bruts et normalisés se côtoient : on ignore les CR de fin de ligne)
+                    c.args(["diff", "--no-color", "--ignore-cr-at-eol", &before, &a]);
                     out(c)
                 })
                 .unwrap_or_default();
@@ -235,8 +247,8 @@ fn handle(req: Req) -> Resp {
             let minus = lines.iter().filter(|l| l.kind == LineKind::Del).count() as u32;
             Resp::BurstDiff { id, lines, plus, minus }
         }
-        Req::BurstRestore { root, id, to, base, files, redo } => {
-            let res = burst_restore(&root, &to, &base, &files);
+        Req::BurstRestore { root, id, to, base, files, may_remove, raw, eol, redo } => {
+            let res = burst_restore(&root, &to, &base, &files, &may_remove, &raw, &eol);
             Resp::BurstRestored { root, id, redo, res }
         }
     }
@@ -250,6 +262,9 @@ fn handle(req: Req) -> Resp {
 
 /// Fichiers plus gros : pas copiés dans l'instantané (ni restaurés).
 const SNAP_MAX: u64 = 64 * 1024 * 1024;
+/// Fichiers non suivis copiés dans l'instantané de base : au plus ce nombre, et ce volume.
+const UNTRACKED_FILES: usize = 5000;
+const UNTRACKED_BYTES: u64 = 256 * 1024 * 1024;
 
 struct TempIndex(PathBuf);
 impl TempIndex {
@@ -308,27 +323,85 @@ fn abs(root: &Path, rel: &str) -> PathBuf {
 
 /// Arbre = `base` + contenu actuel de `files` sur le disque. Sans `base` : état actuel de tous les
 /// fichiers suivis (index du dépôt + `add -u`). Renvoie l'arbre et les fichiers trop gros ignorés.
-pub fn snapshot(root: &Path, base: Option<&str>, files: &[String]) -> Result<(String, Vec<String>), String> {
+/// Écrit `paths` **tels quels** (aucune conversion de fin de ligne ni filtre) dans l'index
+/// temporaire : une annulation doit redonner exactement les mêmes octets.
+fn overlay_raw(root: &Path, idx: &TempIndex, paths: &[String]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut c = git(root);
+    c.args(["hash-object", "-w", "--no-filters", "--stdin-paths"]);
+    let mut input = paths.join("\n");
+    input.push('\n');
+    let shas = out_stdin(c, input.as_bytes())?;
+    let shas: Vec<&str> = shas.lines().collect();
+    if shas.len() != paths.len() {
+        return Err("git hash-object : réponse incomplète".into());
+    }
+    let mut info = Vec::new();
+    for (sha, p) in shas.iter().zip(paths) {
+        info.extend_from_slice(format!("100644 {sha}\t{p}").as_bytes());
+        info.push(0);
+    }
+    let mut c = idx.cmd(root);
+    c.args(["update-index", "-z", "--index-info"]);
+    out_stdin(c, &info)?;
+    Ok(())
+}
+
+/// Retire de l'index temporaire des chemins disparus (fichier ou dossier entier).
+fn drop_paths(root: &Path, idx: &TempIndex, paths: &[String]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut c = idx.cmd(root);
+    c.args(["rm", "-r", "--cached", "--quiet", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"]);
+    out_stdin(c, &nul_list(paths))?;
+    Ok(())
+}
+
+fn nul_split(s: &str) -> impl Iterator<Item = &str> {
+    s.split('\0').filter(|f| !f.is_empty())
+}
+
+/// Résultat d'un instantané.
+pub struct Snap {
+    pub tree: String,
+    /// Trop gros (ou au-delà du budget des non suivis) : pas dans l'instantané.
+    pub skipped: Vec<String>,
+    /// Chemins copiés tels quels (à restaurer tels quels, voir `burst_restore`).
+    pub raw: Vec<String>,
+    /// Instantané de base : fin de ligne réelle sur le disque (`true` = CRLF) des fichiers suivis.
+    /// Leur contenu vient de l'index, normalisé : `git restore` ressortirait la fin de ligne de
+    /// la configuration, pas forcément celle du fichier (un fichier LF écrit par un outil puis
+    /// commité avec autocrlf=true reviendrait en CRLF).
+    pub eol: Vec<(String, bool)>,
+}
+
+/// Arbre = `base` + contenu actuel de `files` sur le disque. Sans `base` : état actuel du dépôt
+/// (index + fichiers suivis modifiés + non suivis hors .gitignore, bornés).
+pub fn snapshot(root: &Path, base: Option<&str>, files: &[String]) -> Result<Snap, String> {
     let idx = TempIndex::new();
     let mut skipped = Vec::new();
+    let mut raw = Vec::new();
+    let mut eol = Vec::new();
     match base {
         Some(tree) => {
             let mut c = idx.cmd(root);
             c.args(["read-tree", tree]);
             out(c)?;
-            let mut keep = Vec::new();
+            let mut gone = Vec::new();
             for f in files {
-                match std::fs::metadata(abs(root, f)) {
+                match std::fs::symlink_metadata(abs(root, f)) {
                     Ok(m) if m.is_dir() => {}
                     Ok(m) if m.len() > SNAP_MAX => skipped.push(f.clone()),
-                    _ => keep.push(f.clone()),
+                    Ok(m) if m.is_file() => raw.push(f.clone()),
+                    Ok(_) => {} // lien : on n'y touche pas
+                    Err(_) => gone.push(f.clone()),
                 }
             }
-            if !keep.is_empty() {
-                let mut c = idx.cmd(root);
-                c.args(["update-index", "--add", "--remove", "-z", "--stdin"]);
-                out_stdin(c, &nul_list(&keep))?;
-            }
+            drop_paths(root, &idx, &gone)?;
+            overlay_raw(root, &idx, &raw)?;
         }
         None => {
             let mut c = git(root);
@@ -342,39 +415,196 @@ pub fn snapshot(root: &Path, base: Option<&str>, files: &[String]) -> Result<(St
                 c.args(["read-tree", "--empty"]);
                 out(c)?;
             }
-            let mut c = idx.cmd(root);
-            c.args(["add", "-u"]);
-            out(c)?;
+            // Suivis supprimés, suivis modifiés, puis non suivis (un agent peut modifier des notes
+            // jamais commitées : il faut pouvoir les remettre). Bornés en nombre et en taille.
+            let mut c = git(root);
+            c.args(["ls-files", "-d", "-z"]);
+            let deleted: Vec<String> = nul_split(&out(c)?).map(String::from).collect();
+            drop_paths(root, &idx, &deleted)?;
+            let mut c = git(root);
+            c.args(["ls-files", "-m", "-z"]);
+            let modified = out(c)?;
+            let mut c = git(root);
+            c.args(["ls-files", "-o", "--exclude-standard", "-z"]);
+            let untracked = out(c)?;
+            let mut budget = UNTRACKED_BYTES;
+            let candidates = nul_split(&modified).chain(nul_split(&untracked).take(UNTRACKED_FILES));
+            for f in candidates {
+                match std::fs::symlink_metadata(abs(root, f)) {
+                    Ok(m) if m.is_file() && m.len() <= SNAP_MAX && m.len() <= budget => {
+                        budget -= m.len();
+                        raw.push(f.to_string());
+                    }
+                    Ok(m) if m.is_file() => skipped.push(f.to_string()),
+                    _ => {}
+                }
+            }
+            raw.sort();
+            raw.dedup();
+            overlay_raw(root, &idx, &raw)?;
+            // « i/lf    w/crlf  attr/…\tchemin »
+            let mut c = git(root);
+            c.args(["ls-files", "--eol", "-z"]);
+            for rec in nul_split(&out(c)?) {
+                let Some((info, path)) = rec.split_once('\t') else { continue };
+                match info.split_whitespace().find_map(|t| t.strip_prefix("w/")) {
+                    Some("crlf") => eol.push((path.to_string(), true)),
+                    Some("lf") => eol.push((path.to_string(), false)),
+                    _ => {} // binaire, mixte, vide : on laisse git faire
+                }
+            }
         }
     }
     let mut c = idx.cmd(root);
     c.arg("write-tree");
-    Ok((out(c)?.trim().to_string(), skipped))
+    Ok(Snap { tree: out(c)?.trim().to_string(), skipped, raw, eol })
 }
 
-/// Remet `files` dans l'état de l'arbre `to` : contenu de `to` pour ceux qu'il contient, corbeille
-/// pour les autres (créés depuis). Renvoie (état d'avant, état d'après).
-pub fn burst_restore(root: &Path, to: &str, base: &str, files: &[String]) -> Result<(String, String), String> {
-    let (undo, _) = snapshot(root, Some(base), files)?;
+/// Écrit sur le disque, octet pour octet, le contenu de `paths` dans l'arbre `tree`.
+fn write_raw_from(root: &Path, tree: &str, paths: &[String]) -> Result<(), String> {
+    use std::io::{BufRead, Read, Write};
+    use std::process::Stdio;
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut c = git(root);
+    c.args(["cat-file", "--batch"]);
+    let mut child = c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| e.to_string())?;
+    let mut input = String::new();
+    for p in paths {
+        input.push_str(&format!("{tree}:{p}\n"));
+    }
+    let mut stdin = child.stdin.take().ok_or("git cat-file")?;
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let mut r = std::io::BufReader::new(child.stdout.take().ok_or("git cat-file")?);
+    for p in paths {
+        let mut head = String::new();
+        r.read_line(&mut head).map_err(|e| e.to_string())?;
+        // « <sha> blob <taille> » ou « <objet> missing »
+        let size: usize = head.trim_end().rsplit(' ').next().and_then(|n| n.parse().ok()).ok_or_else(|| format!("{p} : {}", head.trim()))?;
+        let mut data = vec![0u8; size];
+        r.read_exact(&mut data).map_err(|e| e.to_string())?;
+        let mut nl = [0u8; 1];
+        r.read_exact(&mut nl).map_err(|e| e.to_string())?;
+        let dst = abs(root, p);
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&dst, &data).map_err(|e| format!("{p} : {e}"))?;
+    }
+    let _ = writer.join();
+    let _ = child.wait();
+    Ok(())
+}
+
+/// Remet un fichier texte en LF ou en CRLF partout (rien si ce n'est pas du texte).
+fn set_eol(p: &Path, crlf: bool) {
+    let Ok(data) = std::fs::read(p) else { return };
+    if data.contains(&0) {
+        return;
+    }
+    let mut out = Vec::with_capacity(data.len() + data.len() / 32);
+    for (i, &b) in data.iter().enumerate() {
+        if b == b'\r' && data.get(i + 1) == Some(&b'\n') {
+            continue; // remis ci-dessous avec le \n
+        }
+        if b == b'\n' && crlf {
+            out.push(b'\r');
+        }
+        out.push(b);
+    }
+    if out != data {
+        let _ = std::fs::write(p, out);
+    }
+}
+
+/// Résultat d'une restauration de passe.
+pub struct Restored {
+    /// État d'avant la restauration (pour « Rétablir »).
+    pub undo: String,
+    /// État d'après (base de la passe suivante).
+    pub post: String,
+    /// Chemins laissés tels quels (absents de `to`, état d'avant inconnu).
+    pub kept: usize,
+    /// Chemins copiés tels quels dans les instantanés pris ici.
+    pub raw: Vec<String>,
+}
+
+/// Remet `files` dans l'état de l'arbre `to`.
+/// - ce que `to` contient (fichier, ou tout ce qui est sous un dossier) est réécrit depuis `to` :
+///   octet pour octet pour les chemins de `raw` (copiés tels quels), par `git restore` sinon
+///   (contenu venu de l'index du dépôt, que git sait ressortir exactement) ;
+/// - un chemin absent de `to` ne part à la corbeille que s'il est dans `may_remove` (créé par la
+///   passe, ou supprimé par elle quand on la rétablit) et que c'est un fichier ; sinon on n'y touche
+///   pas (état d'avant inconnu) et il est compté dans `kept`.
+pub fn burst_restore(
+    root: &Path,
+    to: &str,
+    base: &str,
+    files: &[String],
+    may_remove: &[String],
+    raw: &std::collections::HashSet<String>,
+    eol: &HashMap<String, bool>,
+) -> Result<Restored, String> {
+    let before = snapshot(root, Some(base), files)?;
     let mut c = git(root);
     c.args(["ls-tree", "-r", "-z", "--name-only", to]);
     let listed = out(c)?;
-    let present: std::collections::HashSet<&str> = listed.split('\0').filter(|s| !s.is_empty()).collect();
-    let (inside, outside): (Vec<String>, Vec<String>) = files.iter().cloned().partition(|f| present.contains(f.as_str()));
-    if !inside.is_empty() {
-        let mut c = git(root);
-        c.args(["--literal-pathspecs", "restore", "--worktree", "--pathspec-from-file=-", "--pathspec-file-nul"]);
-        c.arg(format!("--source={to}"));
-        out_stdin(c, &nul_list(&inside))?;
-    }
-    for f in &outside {
-        let p = abs(root, f);
-        if p.exists() {
-            trash::delete(&p).map_err(|e| format!("{f} : {e}"))?;
+    let present: Vec<&str> = nul_split(&listed).collect();
+    let present_set: std::collections::HashSet<&str> = present.iter().copied().collect();
+    let mut inside: Vec<String> = Vec::new();
+    let mut outside: Vec<&String> = Vec::new();
+    for f in files {
+        if present_set.contains(f.as_str()) {
+            inside.push(f.clone());
+            continue;
+        }
+        let prefix = format!("{f}/");
+        let under: Vec<String> = present.iter().filter(|p| p.starts_with(&prefix)).map(|p| p.to_string()).collect();
+        if under.is_empty() {
+            outside.push(f);
+        } else {
+            inside.extend(under); // dossier : on remet tout ce qu'il contenait
         }
     }
-    let (post, _) = snapshot(root, Some(&undo), files)?;
-    Ok((undo, post))
+    inside.sort();
+    inside.dedup();
+    let (exact, via_git): (Vec<String>, Vec<String>) = inside.into_iter().partition(|f| raw.contains(f));
+    write_raw_from(root, to, &exact)?;
+    if !via_git.is_empty() {
+        let mut c = git(root);
+        c.args(["restore", "--worktree", "--pathspec-from-file=-", "--pathspec-file-nul"]);
+        c.arg(format!("--source={to}"));
+        out_stdin(c, &nul_list(&via_git))?;
+        // Fin de ligne d'origine (voir `Snap::eol`).
+        for f in &via_git {
+            if let Some(&crlf) = eol.get(f) {
+                set_eol(&abs(root, f), crlf);
+            }
+        }
+    }
+    let mut kept = 0;
+    let mut dirs = Vec::new();
+    for f in outside {
+        let p = abs(root, f);
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) if m.is_file() && may_remove.contains(f) => trash::delete(&p).map_err(|e| format!("{f} : {e}"))?,
+            Ok(m) if m.is_dir() && may_remove.contains(f) => dirs.push(p),
+            Ok(_) => kept += 1,
+            Err(_) => {}
+        }
+    }
+    // Dossiers créés par la passe : retirés seulement s'ils sont vides une fois ses fichiers partis.
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    for d in dirs {
+        let _ = std::fs::remove_dir(&d);
+    }
+    let after = snapshot(root, Some(&before.tree), files)?;
+    let mut raw: Vec<String> = before.raw;
+    raw.extend(after.raw);
+    Ok(Restored { undo: before.tree, post: after.tree, kept, raw })
 }
 
 fn done(what: &'static str, r: Result<String, String>, root: PathBuf) -> Resp {
