@@ -44,10 +44,10 @@ Profil release : `lto = "thin"`, `codegen-units = 4`, `strip = true`. En dev, d�
 | `src/ui.rs` | Dessin : onglets, barre d'outils, barre latérale, liste et grille virtualisées, double volet, aperçu, vue Dev, fenêtres |
 | `src/extras.rs` | Palette « Aller à » (Ctrl+P), aperçu plein écran (Espace), renommage en lot |
 | `src/commands.rs` | Liste des commandes de la palette Ctrl+K et de l'aide F1 (`App::commands`, `App::run_command`) |
-| `src/fsx.rs` | Lecture des dossiers, `Entry`, formats taille/date, types de fichiers |
-| `src/thumbs.rs` | Miniatures sur 2–4 threads (décodeurs du socle + cache disque QOI, sinon fournisseur Windows) |
+| `src/fsx.rs` | Lecture des dossiers, `Entry`, formats taille/date, types de fichiers ; **seule** liste des dossiers bruyants (`is_build_dir`, `is_system_dir`, `is_noisy_dir`) et **seule** boucle `FindFirstFileExW` (`for_each_entry`) |
+| `src/thumbs.rs` | Miniatures sur 2–4 threads, la demande la plus récente d'abord, 200 en attente au plus (décodeurs du socle + cache disque QOI, sinon fournisseur Windows) |
 | `src/ops.rs` | File d'opérations (copie, déplacement, corbeille, zip, conversion) avec annulation |
-| `src/sizes.rs` | Taille des dossiers en parallèle (rayon + FindFirstFileExW), cache des sous-dossiers |
+| `src/sizes.rs` | Taille des dossiers en parallèle (rayon + `fsx::for_each_entry`), cache des sous-dossiers réutilisé par les calculs suivants |
 | `src/spacemap.rs` | Carte de l'espace disque (E3) : arbre lu sur un thread, disposition « en carrés », dessin et clics |
 | `src/index.rs` | Index global des noms de fichiers (Ctrl+P) avec date de modification, sauvegardé sur disque (`EXPLIDX2`) |
 | `src/recents.rs` | Récents partout (E2) : onglet virtuel `::Récents`, surveillance en direct des disques fixes, filtres de bruit |
@@ -63,12 +63,18 @@ puis `handle_keys()`, puis `draw()` qui ne fait que **collecter des `Action`**, 
 `apply_actions()`. Le dessin ne modifie jamais l'état directement (évite les conflits d'emprunt).
 Les événements disque sont regroupés par image et appliqués en place à la liste (pas de rechargement).
 
-**Threads** : boucle UI (principal) ; 1 thread par chargement de dossier ; 2–4 miniatures ; 1 file
-d'opérations ; 1 git ; 1 pool rayon (4–16) pour les tailles ; 1 index ; pool `ignore` pour la recherche
-récursive ; watcher `notify` (onglets + dépôt) ; watcher `notify` récursif des disques fixes (récents, si la
-recherche globale est active) ; 1 écoute du tube d'instance (bloquante, 0 % CPU) ; 1 ménage du cache de
-miniatures au lancement ; threads ponctuels (mise à jour, candidats d'autocomplétion de la barre d'adresse,
-lecture de l'onglet « Récents », lecture de l'arbre de la carte de l'espace).
+**Threads** : boucle UI (principal, **aucun accès disque**) ; 1 thread par chargement de dossier ; 2–4
+miniatures ; 1 file d'opérations ; 1 git (+ 1 thread par push) ; 1 pool rayon (4–16) pour les tailles ; 1 index ;
+pool `ignore` pour la recherche récursive ; watcher `notify` (onglets + dépôt) ; watcher `notify` récursif des
+disques fixes (récents, si la recherche globale est active) ; 1 écoute du tube d'instance (bloquante, 0 % CPU) ;
+1 ménage du cache de miniatures au lancement ; threads ponctuels (mise à jour, disques et espace libre toutes
+les 10 s, début d'un fichier texte pour l'aperçu, écriture des réglages, candidats d'autocomplétion de la barre
+d'adresse, lecture de l'onglet « Récents », lecture de l'arbre de la carte de l'espace, réinscription de
+l'explorateur par défaut).
+
+**Au repos (CPU ~0 %)** : rien ne redessine sans raison. Seules exceptions bornées : estompage des
+surlignages (8 s), toasts, vue Dev (« il y a N s » : chaque seconde la 1re minute, toutes les 30 s jusqu'à 1 h).
+Les événements disque ignorés par `.gitignore` sont écartés avant tout accès au disque.
 Repaint demandé par les threads via `ctx.request_repaint()` → `EventLoopProxy`.
 
 ## 4. Direction artistique
@@ -153,7 +159,9 @@ onglet, lettres = aller au fichier. Ctrl+chiffre marche en AZERTY grâce à `soc
 (touche physique).
 
 **Réglages** : `%APPDATA%\Explorateur\settings.json` (`Settings` sérialisé par serde, `#[serde(default)]`,
-écriture atomique via `.tmp` + renommage) : thème, mode, vue, onglets, épingles, visites (Ctrl+P), taille de
+écriture atomique). Écrits peu après chaque changement par `socle::settings::Saver` sur un thread (empreinte
+des réglages comparée au plus toutes les 3 s quand l'interface se redessine ; erreur → toast), et à la
+fermeture (`flush`). Contenu : thème, mode, vue, onglets, épingles, visites (Ctrl+P), taille de
 fenêtre, historiques d'autocomplétion (adresse, filtre), commandes récentes de Ctrl+K, options
 (`socle::settings`). Autres fichiers : `%APPDATA%\Explorateur\crash.log` (`socle::crash`),
 `%LOCALAPPDATA%\Explorateur\index.bin`, `%LOCALAPPDATA%\Explorateur\miniatures\` (cache QOI, 500 Mo max,
@@ -168,8 +176,15 @@ Panique → `crash.log` avec pile d'appels, signalé au lancement suivant.
 installateur. `Explorateur.exe [dossier]`. Une 2ᵉ instance transmet le dossier à la première par
 `socle::instance` (mutex nommé + tube, < 1 ms, plus de sondage). Mise à jour (`socle::update`, constante
 `app::UPDATER`) : vérification de `https://api.github.com/repos/Desarrh/explorateur/releases/latest` une
-fois par 24 h, asset `*windows-x64.zip`, l'exe en cours est renommé `.old`, le nouveau le remplace, relance
-avec `--apres-maj` (la nouvelle instance attend 0,8 s que l'ancienne rende le mutex). En dev : `scripts\maj.ps1`.
+fois par 24 h, asset `*windows-x64.zip` vérifié par son empreinte SHA-256 (champ `digest` de GitHub), l'exe
+en cours est renommé `.old`, le nouveau le remplace, relance avec `--apres-maj`. En dev : `scripts\maj.ps1`.
+
+**Explorateur par défaut** (HKCU seulement, `winx::default_explorer`) : verbe par défaut des classes
+`Directory` et `Drive` + Win+E (`CLSID\{52205fd8-…}\shell\opennewwindow`). Commande `"exe" "%1"` pour un dossier
+et `"exe" %1` pour un disque (avec guillemets, « C:\" » arrivait en « C:" » ; un guillemet final est de toute façon
+retiré à la réception). L'ancienne valeur par défaut est gardée (`AncienDefaut`, `AncienWinE`) et remise à la
+désactivation. Jamais activé depuis `target\` ni depuis un conteneur d'app ; au démarrage, chemin réinscrit si
+l'exe a bougé. Secours : `Explorateur.exe --retablir-explorateur`.
 
 **Conteneur MSIX** : tout ce que lance l'app Claude (commandes, `maj.ps1`) écrit ses nouveaux fichiers
 d'AppData dans `%LOCALAPPDATA%\Packages\Claude_…\LocalCache`, invisible pour l'utilisateur, et son registre
@@ -180,7 +195,7 @@ session Claude : petit exe sans fenêtre lancé par `explorer.exe` (voir `target
 
 **Mode test (règle n° 0)** : `--test-hors-ecran` ou `SOCLE_TEST=1` → fenêtre invisible et sans focus
 (`socle::testmode::hide`), priorité basse, nom d'app `ExplorateurTest` (mutex, tube, cache, journal à part),
-réglages dans `%TEMP%\explorateur-test\`. Les tests visuels se font **sans fenêtre** : `tests::capture_png`
+réglages d'`ExplorateurTest`. Les tests visuels se font **sans fenêtre** : `tests::capture_png`
 (egui + rendu CPU dans un tampon → PNG), p. ex. `CAPTURE_DIR=<dossier> cargo test --release capture_ -- --ignored`.
 Un test ne surveille jamais les vrais disques ni l'instance de l'utilisateur.
 
@@ -204,14 +219,26 @@ les commits. Dépôt public `Desarrh/explorateur`.
   ouvert (instance unique du socle) ; si le lecteur manque, échoue ou sort en erreur dans la seconde, aperçu plein
   écran intégré (← → pour naviguer), sans erreur. On ne parle jamais directement au tube du lecteur.
 - Copier/couper/coller compatible Explorateur, glisser-déposer entrant et **sortant** (Bureau, Discord…).
-- Annulation (copie, déplacement, renommage, création, corbeille, zip, conversion).
-- Zip / dézip, nouveau dossier/fichier, corbeille / suppression définitive, propriétés, ouvrir avec.
+  Copie et zip : l'élément choisi est suivi s'il est un lien, mais les liens et jonctions à l'intérieur sont
+  ignorés (pas de boucle).
+- Annulation (copie, déplacement, renommage, création, corbeille, zip, conversion). Renommages et annulations
+  en deux temps (noms temporaires) : les lots « décalés » (b→a, c→b) marchent, rien n'est jamais écrasé.
+- Zip / dézip, nouveau dossier/fichier, corbeille / suppression définitive, propriétés, ouvrir avec. Dézip
+  entrée par entrée : chemins sûrs seulement, liens ignorés, 64 Go et l'espace libre au plus, chaque entrée
+  limitée à sa taille annoncée, annulable.
 - Menu Windows natif complet (sous-menus « Envoyer vers », « Ouvrir avec » câblés).
 - Vue Dev : changements git (+/−), cases de commit, diff, commit, push, restauration, flux d'activité.
 - **Rafales d'agent** (E1) : dans l'activité en direct, vue « Passes » : les changements faits d'affilée
   (20 s de silence ferment une passe) sont regroupés ; diff cumulé de la passe dans le volet de droite,
   « Annuler la passe » (état d'avant, fichiers créés à la corbeille) puis « Rétablir », Claude Code sur le
-  dépôt. Instantanés git sans toucher à l'index, à la branche ni à l'historique.
+  dépôt. Instantanés git sans toucher à l'index, à la branche ni à l'historique : index temporaire
+  (`GIT_INDEX_FILE`), contenus copiés **tels quels** (`hash-object --no-filters`) et remis octet pour octet
+  (`cat-file --batch`) ; l'instantané de base prend aussi les fichiers suivis modifiés et les non suivis
+  (5 000 fichiers / 256 Mo au plus) et note la fin de ligne réelle des fichiers suivis (`ls-files --eol`), remise
+  après `git restore`. La corbeille ne prend que ce que la passe a créé (ou supprimé, quand on la rétablit) ;
+  un dossier supprimé revient avec son contenu ; un fichier dont l'état d'avant est inconnu reste tel quel
+  (signalé). Une passe qui démarre pendant un instantané attend son résultat pour son « avant ». Toutes les
+  commandes git prennent les chemins à la lettre (`GIT_LITERAL_PATHSPECS`).
 - **Récents partout** (E2) : onglet « Récents » (barre latérale) — fichiers modifiés sur tous les disques
   fixes, du plus récent au plus ancien, en direct ; AppData, Program Files, dossiers cachés, builds et
   fichiers temporaires ignorés. Se comporte comme un dossier (ouvrir, aperçu, glisser, menu).
@@ -241,8 +268,9 @@ les commits. Dépôt public `Desarrh/explorateur`.
 ## 8. Limites connues / dette technique
 
 - Windows uniquement.
-- Index global non live (reconstruit au lancement puis toutes les 20 min) ; ~160 Mo de RAM juste après le
-  premier scan (désactivable). Pendant un rescan, l'ancien et le nouvel index coexistent.
+- Index global non live (reconstruit au lancement puis toutes les 6 h, réécrit sur le disque seulement si la
+  liste des noms a changé ou une fois par jour) ; les « Récents » en direct couvrent l'intervalle. ~160 Mo de RAM
+  juste après le premier scan (désactivable). Pendant un rescan, l'ancien et le nouvel index coexistent.
 - Moteur de rendu CPU issu d'une petite crate tierce (`hdrshot-egui-backend`) : risque de bugs d'affichage.
 - Maj+clic pour étendre une sélection pas vérifié à la souris.
 - Fonctions pas encore vérifiées à l'écran : Ctrl+P global, F6, zip depuis l'UI, sous-menus du menu natif,
@@ -256,13 +284,14 @@ les commits. Dépôt public `Desarrh/explorateur`.
 - Rafales d'agent : seulement dans un dépôt git, et pas pendant « Pause » ; les instantanés écrivent des
   objets git non référencés dans `.git/objects` (nettoyés par `git gc`) ; fichiers > 64 Mo ni copiés ni
   restaurés ; une passe ouverte avant le premier instantané du dépôt n'a pas de diff.
-- Récents : sans la recherche globale, pas de récents ; dates de l'index rafraîchies toutes les 20 min, le
+- Récents : sans la recherche globale, pas de récents ; dates de l'index rafraîchies toutes les 6 h, le
   direct ne voit que ce qui change depuis le lancement ; un dépassement du tampon de ReadDirectoryChangesW
   (rafale énorme) fait perdre quelques événements.
 - Carte de l'espace : 400 dossiers lus au plus par carte ; tailles de dossier issues de `sizes.rs` (sans
   la MFT, donc plus lent que WizTree sur un disque entier).
 - Glisser vers l'extérieur (`SHDoDragDrop`) : objet de données testé, geste réel pas encore vérifié à la souris.
-- Test `apercu_rapide_repli_silencieux` sensible à la charge du PC (fenêtre de 1,2 s).
+- Événements disque ignorés par `.gitignore` : la taille des dossiers parents n'est pas invalidée (choix :
+  pas d'accès disque pour les builds) ; elle se met à jour au prochain calcul.
 
 ## 9. Pistes QoL (à valider ; faites : 2, 6, 9)
 
