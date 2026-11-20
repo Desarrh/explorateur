@@ -20,6 +20,8 @@ pub enum Op {
     TrashForUndo(Vec<PathBuf>),
     /// Annulation : remettre des fichiers déplacés/renommés à leur place (to → from).
     MoveBack(Vec<(PathBuf, PathBuf)>),
+    /// Renommage en lot (ancien → nouveau).
+    Rename(Vec<(PathBuf, PathBuf)>),
     /// Annulation : restaurer depuis la corbeille.
     Restore { paths: Vec<PathBuf>, since: SystemTime },
 }
@@ -56,6 +58,7 @@ impl Op {
             Op::Unzip { .. } => "Extraction",
             Op::Convert { .. } => "Conversion",
             Op::MoveBack(_) | Op::Restore { .. } | Op::TrashForUndo(_) => "Annulation",
+            Op::Rename(_) => "Renommage",
         }
     }
 }
@@ -166,23 +169,18 @@ fn run(op: Op, ev: &Sender<OpEvent>, cancel: &AtomicBool, ctx: &egui::Context) {
             }
         }
         Op::MoveBack(pairs) => {
-            let total = pairs.len();
-            for (i, (from, to)) in pairs.iter().enumerate() {
-                progress(i, total, to);
-                if from.exists() {
-                    errors.push(format!("{} existe déjà", from.display()));
-                    continue;
-                }
-                if let Some(parent) = from.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                match move_any(to, from, cancel) {
-                    Ok(()) => {
-                        touched.push(from.clone());
-                        touched.push(to.clone());
-                    }
-                    Err(e) => errors.push(format!("{} : {e}", name_of(to))),
-                }
+            // (to → from), en deux temps : l'annulation d'un renommage « décalé » (b→a, c→b) marche.
+            let back: Vec<(PathBuf, PathBuf)> = pairs.into_iter().map(|(from, to)| (to, from)).collect();
+            let (done, errs) = move_batch(&back, cancel, &progress);
+            errors.extend(errs);
+            touched.extend(done.into_iter().flat_map(|(a, b)| [a, b]));
+        }
+        Op::Rename(pairs) => {
+            let (done, errs) = move_batch(&pairs, cancel, &progress);
+            errors.extend(errs);
+            touched.extend(done.iter().flat_map(|(a, b)| [a.clone(), b.clone()]));
+            if !done.is_empty() {
+                undo = Some(Undo::Moved(done));
             }
         }
         Op::Trash(paths) => {
@@ -276,6 +274,53 @@ fn run(op: Op, ev: &Sender<OpEvent>, cancel: &AtomicBool, ctx: &egui::Context) {
         }
     }
     let _ = ev.send(OpEvent::Finished { label, errors, touched, undo });
+}
+
+/// Déplace ou renomme plusieurs chemins (source → destination) en deux temps : chaque source
+/// prend d'abord un nom temporaire à côté d'elle, puis va à sa destination. Permet a→b, b→c dans
+/// un même lot (et leur annulation). Une destination qui existe (hors celles libérées par le lot)
+/// n'est jamais écrasée : la source reprend son nom. Renvoie les paires faites et les erreurs.
+pub fn move_batch(
+    pairs: &[(PathBuf, PathBuf)],
+    cancel: &AtomicBool,
+    progress: &dyn Fn(usize, usize, &Path),
+) -> (Vec<(PathBuf, PathBuf)>, Vec<String>) {
+    let total = pairs.len();
+    let mut errors = Vec::new();
+    let mut temps = Vec::with_capacity(total);
+    for (i, (src, _)) in pairs.iter().enumerate() {
+        let tmp = src.with_file_name(format!(".explorateur-{}-{i}.tmp", std::process::id()));
+        match std::fs::rename(src, &tmp) {
+            Ok(()) => temps.push(Some(tmp)),
+            Err(e) => {
+                errors.push(format!("{} : {e}", name_of(src)));
+                temps.push(None);
+            }
+        }
+    }
+    let mut done = Vec::new();
+    for (i, ((src, dst), tmp)) in pairs.iter().zip(temps).enumerate() {
+        let Some(tmp) = tmp else { continue };
+        progress(i, total, dst);
+        let res = if cancel.load(Ordering::Relaxed) {
+            Err("annulé".to_string())
+        } else if std::fs::symlink_metadata(dst).is_ok() {
+            Err(format!("{} existe déjà", name_of(dst)))
+        } else {
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            move_any(&tmp, dst, cancel).map_err(|e| format!("{} : {e}", name_of(dst)))
+        };
+        match res {
+            Ok(()) => done.push((src.clone(), dst.clone())),
+            Err(e) => {
+                let _ = std::fs::rename(&tmp, src);
+                errors.push(e);
+            }
+        }
+    }
+    (done, errors)
 }
 
 fn move_any(src: &Path, dst: &Path, cancel: &AtomicBool) -> std::io::Result<()> {

@@ -409,41 +409,9 @@ impl App {
         }
     }
 
+    /// Renommage en lot dans la file d'opérations (deux temps, voir `ops::move_batch`).
     fn do_batch_rename(&mut self, pairs: Vec<(PathBuf, PathBuf)>) {
-        // Deux passes (via des noms temporaires) pour permettre a→b, b→c dans le même lot.
-        let mut temps = Vec::new();
-        let mut errors = Vec::new();
-        for (i, (old, _)) in pairs.iter().enumerate() {
-            let tmp = old.with_file_name(format!(".explorateur-renommage-{i}.tmp"));
-            match std::fs::rename(old, &tmp) {
-                Ok(()) => temps.push(Some(tmp)),
-                Err(e) => {
-                    errors.push(format!("{} : {e}", old.display()));
-                    temps.push(None);
-                }
-            }
-        }
-        let mut done = Vec::new();
-        for ((old, new), tmp) in pairs.iter().zip(temps) {
-            let Some(tmp) = tmp else { continue };
-            match std::fs::rename(&tmp, new) {
-                Ok(()) => done.push((old.clone(), new.clone())),
-                Err(e) => {
-                    let _ = std::fs::rename(&tmp, old);
-                    errors.push(format!("{} : {e}", new.display()));
-                }
-            }
-        }
-        let n = done.len();
-        if !done.is_empty() {
-            self.undo.push(crate::ops::Undo::Moved(done));
-        }
-        self.actions.push(Action::Refresh);
-        if errors.is_empty() {
-            self.toast(format!("{n} élément(s) renommé(s) — Ctrl+Z pour annuler"), false);
-        } else {
-            self.toast(format!("{n} renommé(s), erreurs : {}", errors.join(" · ")), true);
-        }
+        self.ops.submit(crate::ops::Op::Rename(pairs));
     }
 }
 

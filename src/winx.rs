@@ -155,13 +155,20 @@ pub fn virtualized() -> bool {
 }
 
 pub mod default_explorer {
+    //! Explorateur par défaut, **par utilisateur** (HKCU uniquement, réversible) : verbe par défaut
+    //! des dossiers et des disques, et Win+E. L'ancienne valeur par défaut est gardée et remise.
     use super::wide;
     use windows_sys::Win32::System::Registry::{
-        HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegDeleteTreeW, RegGetValueW, RegSetKeyValueW, RRF_RT_REG_SZ,
+        HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegDeleteTreeW, RegGetValueW, RegSetKeyValueW,
     };
 
-    const WIN_E: &str = r"Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}";
+    /// Racine réelle ; les tests en utilisent une autre.
+    pub const CLASSES: &str = r"Software\Classes";
+    const WIN_E: &str = r"CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow\command";
     const VERB: &str = "explorateur";
+    /// Valeurs où l'on garde ce qu'il y avait avant nous.
+    const OLD_DEFAULT: &str = "AncienDefaut";
+    const OLD_WIN_E: &str = "AncienWinE";
 
     fn set(sub: &str, name: Option<&str>, value: &str) -> bool {
         let sub = wide(sub);
@@ -179,12 +186,21 @@ pub mod default_explorer {
         }
     }
 
-    fn get(sub: &str) -> Option<String> {
+    fn get_value(sub: &str, name: Option<&str>) -> Option<String> {
         let sub = wide(sub);
-        let mut buf = vec![0u16; 1024];
+        let name_w = name.map(wide);
+        let mut buf = vec![0u16; 2048];
         let mut len = (buf.len() * 2) as u32;
         let r = unsafe {
-            RegGetValueW(HKEY_CURRENT_USER, sub.as_ptr(), std::ptr::null(), RRF_RT_REG_SZ, std::ptr::null_mut(), buf.as_mut_ptr() as *mut _, &mut len)
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                sub.as_ptr(),
+                name_w.as_ref().map(|n| n.as_ptr()).unwrap_or(std::ptr::null()),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut _,
+                &mut len,
+            )
         };
         if r != 0 {
             return None;
@@ -193,41 +209,120 @@ pub mod default_explorer {
         Some(String::from_utf16_lossy(&buf[..n]))
     }
 
+    fn get(sub: &str) -> Option<String> {
+        get_value(sub, None)
+    }
+
+    fn delete_value(sub: &str, name: Option<&str>) {
+        let sub = wide(sub);
+        let name_w = name.map(wide);
+        unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, sub.as_ptr(), name_w.as_ref().map(|n| n.as_ptr()).unwrap_or(std::ptr::null())) };
+    }
+
+    fn delete_tree(sub: &str) {
+        let sub = wide(sub);
+        unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, sub.as_ptr()) };
+    }
+
+    /// Commande d'ouverture. Pour un disque, `%1` vaut « C:\ » : entre guillemets, le « \" » final
+    /// serait lu comme un guillemet échappé (l'exe recevrait « C:" »), donc pas de guillemets.
+    fn command(exe: &str, class: &str) -> String {
+        if class == "Drive" { format!("\"{exe}\" %1") } else { format!("\"{exe}\" \"%1\"") }
+    }
+
+    pub fn is_enabled_at(base: &str) -> bool {
+        get(&format!(r"{base}\Directory\shell\{VERB}\command")).is_some()
+    }
+
+    /// Exe inscrit dans le registre (entre les premiers guillemets de la commande).
+    pub fn registered_exe_at(base: &str) -> Option<String> {
+        let c = get(&format!(r"{base}\Directory\shell\{VERB}\command"))?;
+        c.strip_prefix('"')?.split('"').next().map(String::from)
+    }
+
+    pub fn enable_at(base: &str, exe: &str) -> Result<(), String> {
+        let mut ok = true;
+        for class in ["Directory", "Drive"] {
+            let shell = format!(r"{base}\{class}\shell");
+            let verb = format!(r"{shell}\{VERB}");
+            // Verbe par défaut d'avant (ex. un autre explorateur) : gardé pour le remettre.
+            if let Some(old) = get(&shell).filter(|v| !v.is_empty() && v != VERB) {
+                ok &= set(&verb, Some(OLD_DEFAULT), &old);
+            }
+            ok &= set(&verb, None, "Ouvrir dans Explorateur");
+            ok &= set(&format!(r"{verb}\command"), None, &command(exe, class));
+            ok &= set(&shell, None, VERB);
+        }
+        let win_e = format!(r"{base}\{WIN_E}");
+        let mine = format!("\"{exe}\"");
+        if let Some(old) = get(&win_e).filter(|v| !v.is_empty() && !v.contains("Explorateur.exe") && v != &mine) {
+            ok &= set(&format!(r"{base}\Directory\shell\{VERB}"), Some(OLD_WIN_E), &old);
+        }
+        ok &= set(&win_e, None, &mine);
+        ok &= set(&win_e, Some("DelegateExecute"), "");
+        if ok { Ok(()) } else { Err("écriture du registre refusée".into()) }
+    }
+
+    pub fn disable_at(base: &str) {
+        let old_win_e = get_value(&format!(r"{base}\Directory\shell\{VERB}"), Some(OLD_WIN_E));
+        for class in ["Directory", "Drive"] {
+            let shell = format!(r"{base}\{class}\shell");
+            let verb = format!(r"{shell}\{VERB}");
+            let old = get_value(&verb, Some(OLD_DEFAULT));
+            delete_tree(&verb);
+            // On ne touche à la valeur par défaut que si c'est la nôtre.
+            if get(&shell).as_deref() == Some(VERB) {
+                match old {
+                    Some(v) => {
+                        set(&shell, None, &v);
+                    }
+                    None => delete_value(&shell, None),
+                }
+            }
+        }
+        let win_e = format!(r"{base}\{WIN_E}");
+        match old_win_e {
+            Some(v) => {
+                set(&win_e, None, &v);
+            }
+            None => delete_tree(&format!(r"{base}\CLSID\{{52205fd8-5dfb-447d-801a-d0b52f2e83e1}}")),
+        }
+    }
+
     pub fn is_enabled() -> bool {
-        get(&format!(r"Software\Classes\Directory\shell\{VERB}\command")).is_some()
+        is_enabled_at(CLASSES)
+    }
+
+    /// Exe de développement (`target\…`) : jamais inscrit comme explorateur par défaut.
+    fn is_dev_build(exe: &std::path::Path) -> bool {
+        exe.components().any(|c| c.as_os_str().eq_ignore_ascii_case("target"))
     }
 
     pub fn enable() -> Result<(), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let exe = exe.to_string_lossy();
-        let open = format!("\"{exe}\" \"%1\"");
-        let mut ok = true;
-        for class in ["Directory", "Drive"] {
-            ok &= set(&format!(r"Software\Classes\{class}\shell\{VERB}"), None, "Ouvrir dans Explorateur");
-            ok &= set(&format!(r"Software\Classes\{class}\shell\{VERB}\command"), None, &open);
-            ok &= set(&format!(r"Software\Classes\{class}\shell"), None, VERB);
+        if is_dev_build(&exe) {
+            return Err("version de développement (target\\) : lance l'exe installé pour ce réglage".into());
         }
-        ok &= set(&format!(r"{WIN_E}\shell\opennewwindow\command"), None, &format!("\"{exe}\""));
-        ok &= set(&format!(r"{WIN_E}\shell\opennewwindow\command"), Some("DelegateExecute"), "");
+        enable_at(CLASSES, &exe.to_string_lossy())?;
         notify_shell();
-        if ok { Ok(()) } else { Err("écriture du registre refusée".into()) }
+        Ok(())
     }
 
     pub fn disable() {
-        unsafe {
-            for class in ["Directory", "Drive"] {
-                let verb = wide(&format!(r"Software\Classes\{class}\shell\{VERB}"));
-                RegDeleteTreeW(HKEY_CURRENT_USER, verb.as_ptr());
-                // On ne retire la valeur par défaut que si c'est la nôtre.
-                if get(&format!(r"Software\Classes\{class}\shell")).as_deref() == Some(VERB) {
-                    let shell = wide(&format!(r"Software\Classes\{class}\shell"));
-                    RegDeleteKeyValueW(HKEY_CURRENT_USER, shell.as_ptr(), std::ptr::null());
-                }
-            }
-            let k = wide(WIN_E);
-            RegDeleteTreeW(HKEY_CURRENT_USER, k.as_ptr());
-        }
+        disable_at(CLASSES);
         notify_shell();
+    }
+
+    /// Au démarrage : l'exe a changé de place (dossier déplacé, nouvelle version ailleurs) alors que
+    /// le réglage est actif → on réinscrit le bon chemin. Rien pour une version de développement
+    /// ni depuis un conteneur d'app (registre virtualisé). Renvoie `true` s'il a été réécrit.
+    pub fn refresh_if_moved() -> bool {
+        let Ok(exe) = std::env::current_exe() else { return false };
+        let Some(reg) = registered_exe_at(CLASSES) else { return false };
+        if reg.eq_ignore_ascii_case(&exe.to_string_lossy()) || is_dev_build(&exe) || super::virtualized() {
+            return false;
+        }
+        enable().is_ok()
     }
 
     fn notify_shell() {
@@ -462,5 +557,7 @@ pub fn open_terminal(dir: &Path) {
 }
 
 pub fn open_in_code(path: &Path) -> bool {
-    hidden_cmd("cmd").args(["/C", "code"]).arg(path).spawn().is_ok()
+    // code.cmd directement (pas « cmd /C code <chemin> » : un « & » dans le chemin serait exécuté).
+    // La bibliothèque standard échappe les arguments d'un .cmd, ou refuse s'ils sont dangereux.
+    hidden_cmd("code.cmd").arg(path).spawn().is_ok()
 }

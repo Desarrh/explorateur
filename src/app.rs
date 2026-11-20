@@ -394,7 +394,7 @@ pub struct App {
     pub active: usize,
     next_id: u64,
     pub thumbs: Thumbs,
-    ops: Ops,
+    pub ops: Ops,
     git: Git2,
     watcher: Option<RecommendedWatcher>,
     watch_rx: Receiver<notify::Result<notify::Event>>,
@@ -665,6 +665,12 @@ impl App {
         if app.s.global_index {
             app.index = Some(crate::index::Index::start(&ctx));
             app.start_recents();
+        }
+        // Explorateur par défaut actif mais exe déplacé : on réinscrit le bon chemin (hors du fil
+        // de l'interface : registre + sonde de conteneur).
+        #[cfg(windows)]
+        if app.is_default {
+            std::thread::spawn(|| winx::default_explorer::refresh_if_moved());
         }
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         if app.s.auto_update && now - app.s.last_update_check > 24 * 3600 {
@@ -1460,7 +1466,8 @@ impl App {
             self.fullview = Some(p);
         }
         while let Ok(req) = self.inbox_rx.try_recv() {
-            let p = PathBuf::from(req.trim());
+            // (un disque peut arriver en « C:" » depuis une ancienne inscription du registre)
+            let p = PathBuf::from(req.trim().trim_end_matches('"'));
             let p = if p.is_dir() { p } else { dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\")) };
             let i = self.add_tab(p);
             self.active = i;
@@ -1974,7 +1981,9 @@ impl App {
                     return;
                 }
                 let target = r.path.with_file_name(&new_name);
-                if target.exists() && !target.to_string_lossy().eq_ignore_ascii_case(&r.path.to_string_lossy()) {
+                // (même fichier à la casse près, accents compris : « Été » → « été »)
+                let same = target.to_string_lossy().to_lowercase() == r.path.to_string_lossy().to_lowercase();
+                if target.exists() && !same {
                     self.toast(format!("« {new_name} » existe déjà"), true);
                     return;
                 }

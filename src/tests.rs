@@ -874,3 +874,91 @@ fn rafale_passe_pendant_cloture() {
     assert_eq!(reqs.len(), 1);
     assert_eq!(reqs[0].base.as_deref(), Some("T1"));
 }
+
+/// Audit n° 5 et 18 : renommage en lot « décalé » (b→a, c→b), puis son annulation, par la file.
+#[test]
+fn renommage_en_lot_decale_et_annulation() {
+    let d = tmpdir("lot-decale");
+    for (f, c) in [("b.txt", "B"), ("c.txt", "C")] {
+        std::fs::write(d.join(f), c).unwrap();
+    }
+    let pairs = vec![(d.join("b.txt"), d.join("a.txt")), (d.join("c.txt"), d.join("b.txt"))];
+    let (err, undo) = run_op(crate::ops::Op::Rename(pairs));
+    assert!(err.is_empty(), "{err:?}");
+    assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap(), "B");
+    assert_eq!(std::fs::read_to_string(d.join("b.txt")).unwrap(), "C");
+    assert!(!d.join("c.txt").exists());
+    let Some(crate::ops::Undo::Moved(done)) = undo else { panic!("pas d'annulation") };
+    let (err, _) = run_op(crate::ops::Op::MoveBack(done));
+    assert!(err.is_empty(), "annulation : {err:?}");
+    assert_eq!(std::fs::read_to_string(d.join("b.txt")).unwrap(), "B");
+    assert_eq!(std::fs::read_to_string(d.join("c.txt")).unwrap(), "C");
+    assert!(!d.join("a.txt").exists());
+    // Une destination qui existe hors du lot n'est jamais écrasée.
+    std::fs::write(d.join("x.txt"), "X").unwrap();
+    let (err, undo) = run_op(crate::ops::Op::Rename(vec![(d.join("b.txt"), d.join("x.txt"))]));
+    assert_eq!(err.len(), 1);
+    assert!(undo.is_none());
+    assert_eq!(std::fs::read_to_string(d.join("x.txt")).unwrap(), "X");
+    assert_eq!(std::fs::read_to_string(d.join("b.txt")).unwrap(), "B", "la source garde son nom");
+    // Audit n° 6 : seule la casse d'une lettre accentuée change.
+    std::fs::write(d.join("Été.txt"), "e").unwrap();
+    let (err, _) = run_op(crate::ops::Op::Rename(vec![(d.join("Été.txt"), d.join("été.txt"))]));
+    assert!(err.is_empty(), "{err:?}");
+    let names: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.contains(&"été.txt".to_string()), "{names:?}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Audit n° 17 : suppression définitive (dossier compris), et corbeille puis restauration.
+#[test]
+fn suppression_et_restauration() {
+    let d = tmpdir("suppr");
+    std::fs::create_dir_all(d.join("dossier")).unwrap();
+    std::fs::write(d.join("dossier").join("a.txt"), "a").unwrap();
+    std::fs::write(d.join("seul.txt"), "s").unwrap();
+    let (err, _) = run_op(crate::ops::Op::Delete(vec![d.join("dossier"), d.join("seul.txt")]));
+    assert!(err.is_empty(), "{err:?}");
+    assert!(!d.join("dossier").exists() && !d.join("seul.txt").exists());
+    let f = d.join("corbeille.txt");
+    std::fs::write(&f, "c").unwrap();
+    let (err, undo) = run_op(crate::ops::Op::Trash(vec![f.clone()]));
+    assert!(err.is_empty(), "{err:?}");
+    assert!(!f.exists());
+    let Some(crate::ops::Undo::Trashed { paths, at }) = undo else { panic!("pas d'annulation") };
+    let (err, _) = run_op(crate::ops::Op::Restore { paths, since: at });
+    assert!(err.is_empty(), "{err:?}");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "c");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Audit n° 4, 9 et 17 : registre de l'explorateur par défaut, sous une racine de test
+/// (`HKCU\Software\ExplorateurTest`, jamais les vraies associations).
+#[test]
+fn explorateur_par_defaut_registre() {
+    use crate::winx::default_explorer::{disable_at, enable_at, is_enabled_at, registered_exe_at};
+    let base = r"Software\ExplorateurTest\Classes";
+    let reg = |sub: &str| -> Option<String> {
+        let o = std::process::Command::new("reg").args(["query", &format!(r"HKCU\{base}\{sub}"), "/ve"]).output().ok()?;
+        let t = String::from_utf8_lossy(&o.stdout).into_owned();
+        o.status.success().then(|| t.lines().find(|l| l.contains("REG_SZ")).map(|l| l.split("REG_SZ").nth(1).unwrap_or("").trim().replace("(value not set)", "")).unwrap_or_default())
+    };
+    let set = |sub: &str, v: &str| {
+        let ok = std::process::Command::new("reg").args(["add", &format!(r"HKCU\{base}\{sub}"), "/ve", "/d", v, "/f"]).output().unwrap().status.success();
+        assert!(ok);
+    };
+    let _ = std::process::Command::new("reg").args(["delete", r"HKCU\Software\ExplorateurTest", "/f"]).output();
+    set(r"Directory\shell", "autre-explorateur"); // valeur d'avant, à garder
+    let exe = r"C:\Apps\Explorateur\Explorateur.exe";
+    enable_at(base, exe).unwrap();
+    assert!(is_enabled_at(base));
+    assert_eq!(registered_exe_at(base).as_deref(), Some(exe));
+    assert_eq!(reg(r"Drive\shell\explorateur\command").as_deref(), Some(format!("\"{exe}\" %1").as_str()), "disque : %1 sans guillemets");
+    assert_eq!(reg(r"Directory\shell\explorateur\command").as_deref(), Some(format!("\"{exe}\" \"%1\"").as_str()));
+    assert_eq!(reg(r"Directory\shell").as_deref(), Some("explorateur"));
+    disable_at(base);
+    assert!(!is_enabled_at(base));
+    assert_eq!(reg(r"Directory\shell").as_deref(), Some("autre-explorateur"), "ancienne valeur remise");
+    assert_eq!(reg(r"Drive\shell").as_deref(), Some(""), "sans valeur d'avant : retirée");
+    let _ = std::process::Command::new("reg").args(["delete", r"HKCU\Software\ExplorateurTest", "/f"]).output();
+}
