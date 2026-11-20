@@ -7,13 +7,17 @@
 //!   des centaines de milliers de fichiers ;
 //! - sauvegardé sur disque : disponible dès le lancement, puis rafraîchi en arrière-plan.
 //! Everything lit le journal NTFS en direct, mais il faut un service administrateur ; ici l'index
-//! est reconstruit au démarrage puis toutes les 20 minutes.
+//! est reconstruit au démarrage puis toutes les 6 heures (les « Récents » en direct couvrent le reste).
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 const NONE: u32 = u32::MAX;
-const RESCAN: Duration = Duration::from_secs(20 * 60);
+/// Reconstruction complète : rare, les « Récents » en direct couvrent ce qui change entre-temps.
+const RESCAN: Duration = Duration::from_secs(6 * 3600);
+/// L'index n'est réécrit sur le disque que si la liste des noms a changé, ou au plus une fois par
+/// jour pour rafraîchir les dates.
+const REWRITE_DATES: Duration = Duration::from_secs(24 * 3600);
 /// Dossiers qu'on n'indexe pas : système, corbeilles, et dossiers « bruyants » de build.
 const SKIP_DIRS: [&str; 11] = [
     "$recycle.bin", "system volume information", "windows", "node_modules", "target", ".git", "__pycache__", ".cache",
@@ -100,6 +104,17 @@ impl Data {
 
     pub fn len(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Empreinte de la liste des noms (sans les dates) : l'index a-t-il changé ?
+    fn names_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.lower.hash(&mut h);
+        for n in &self.nodes {
+            (n.parent, n.flags).hash(&mut h);
+        }
+        h.finish()
     }
 
     fn name(&self, i: u32) -> &str {
@@ -259,7 +274,7 @@ fn index_file() -> Option<PathBuf> {
 }
 
 impl Index {
-    /// Charge l'index sauvegardé puis le reconstruit en arrière-plan (et toutes les 20 min).
+    /// Charge l'index sauvegardé puis le reconstruit en arrière-plan (et toutes les 6 h).
     pub fn start(ctx: &egui::Context) -> Index {
         let data = Arc::new(RwLock::new(Data::default()));
         let scanning = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -277,12 +292,18 @@ impl Index {
                 }
                 loop {
                     s2.store(true, std::sync::atomic::Ordering::Relaxed);
-                    let fresh = scan_all();
+                    // Réserve à la taille de l'index précédent : pas de réallocations en cours de route.
+                    let (hint_nodes, hint_text, old_sig) =
+                        d2.read().map(|d| (d.nodes.len(), d.lower.len(), d.names_signature())).unwrap_or((0, 0, 0));
+                    let fresh = scan_all(hint_nodes, hint_text);
                     if let Some(f) = index_file() {
                         if let Some(dir) = f.parent() {
                             let _ = std::fs::create_dir_all(dir);
                         }
-                        let _ = fresh.save(&f);
+                        let age = std::fs::metadata(&f).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+                        if fresh.names_signature() != old_sig || age.map(|a| a > REWRITE_DATES).unwrap_or(true) {
+                            let _ = fresh.save(&f);
+                        }
                     }
                     if let Ok(mut w) = d2.write() {
                         *w = fresh;
@@ -303,9 +324,11 @@ pub fn fixed_roots() -> Vec<PathBuf> {
 }
 
 /// Parcourt tous les disques fixes.
-fn scan_all() -> Data {
+fn scan_all(hint_nodes: usize, hint_text: usize) -> Data {
     let t0 = Instant::now();
     let mut d = Data::default();
+    d.nodes.reserve(hint_nodes + hint_nodes / 50);
+    d.lower.reserve(hint_text + hint_text / 50);
     for drive in crate::fsx::drives() {
         if !is_fixed(&drive.root) {
             continue;
@@ -435,7 +458,7 @@ pub fn roundtrip(d: &Data, file: &Path) -> Option<Data> {
 #[cfg(test)]
 pub fn full_scan_for_test() -> (Data, Duration) {
     let t0 = Instant::now();
-    let d = scan_all();
+    let d = scan_all(0, 0);
     let t = t0.elapsed();
     (d, t)
 }

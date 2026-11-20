@@ -257,19 +257,15 @@ fn run(op: Op, ev: &Sender<OpEvent>, cancel: &AtomicBool, ctx: &egui::Context) {
         }
         Op::Unzip { zip, dst } => {
             progress(0, 1, &zip);
-            let r = std::fs::File::open(&zip)
-                .map_err(|e| e.to_string())
-                .and_then(|f| zip::ZipArchive::new(f).map_err(|e| e.to_string()))
-                .and_then(|mut a| {
-                    std::fs::create_dir_all(&dst).map_err(|e| e.to_string())?;
-                    a.extract(&dst).map_err(|e| e.to_string())
-                });
-            match r {
-                Ok(()) => {
-                    touched.push(dst.clone());
-                    undo = Some(Undo::Created(vec![dst]));
-                }
-                Err(e) => errors.push(e),
+            let existed = dst.exists();
+            let r = unzip(&zip, &dst, cancel, &progress);
+            if !existed && dst.exists() {
+                // Même interrompue, l'extraction s'annule d'un Ctrl+Z (dossier créé → corbeille).
+                touched.push(dst.clone());
+                undo = Some(Undo::Created(vec![dst]));
+            }
+            if let Err(e) = r {
+                errors.push(e);
             }
         }
     }
@@ -331,22 +327,117 @@ fn move_any(src: &Path, dst: &Path, cancel: &AtomicBool) -> std::io::Result<()> 
     })
 }
 
+/// Taille décompressée maximale acceptée pour une archive (au-delà : bombe de décompression ou
+/// erreur), en plus de la vérification de l'espace libre.
+const UNZIP_MAX: u64 = 64 << 30;
+
+/// Extraction entrée par entrée : chemins sûrs seulement (`enclosed_name`), liens ignorés, taille
+/// totale annoncée bornée et comparée à l'espace libre, chaque entrée limitée à sa taille
+/// annoncée (une archive qui ment ne remplit pas le disque), annulable entre les entrées et
+/// pendant la copie.
+fn unzip(zip: &Path, dst: &Path, cancel: &AtomicBool, progress: &dyn Fn(usize, usize, &Path)) -> Result<(), String> {
+    use std::io::Read;
+    let f = std::fs::File::open(zip).map_err(|e| e.to_string())?;
+    let mut a = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
+    let mut total: u64 = 0;
+    for i in 0..a.len() {
+        total = total.saturating_add(a.by_index_raw(i).map_err(|e| e.to_string())?.size());
+    }
+    if total > UNZIP_MAX {
+        return Err(format!("archive trop grosse une fois décompressée ({})", crate::fsx::human_size(total)));
+    }
+    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    if let Some(free) = free_space(dst) {
+        if total > free {
+            return Err(format!("pas assez de place : {} nécessaires, {} libres", crate::fsx::human_size(total), crate::fsx::human_size(free)));
+        }
+    }
+    let n = a.len();
+    let mut buf = vec![0u8; 256 * 1024];
+    for i in 0..n {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("annulé".into());
+        }
+        let mut e = a.by_index(i).map_err(|e| e.to_string())?;
+        let Some(rel) = e.enclosed_name() else { continue }; // « ../ » ou chemin absolu : ignoré
+        if e.is_symlink() {
+            continue;
+        }
+        let out = dst.join(rel);
+        progress(i, n, &out);
+        if e.is_dir() {
+            std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let size = e.size();
+        let mut w = std::fs::File::create(&out).map_err(|e| e.to_string())?;
+        let mut left = size;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("annulé".into());
+            }
+            let k = e.read(&mut buf).map_err(|e| e.to_string())?;
+            if k == 0 {
+                break;
+            }
+            if k as u64 > left {
+                return Err(format!("{} : plus gros qu'annoncé dans l'archive", out.display()));
+            }
+            left -= k as u64;
+            std::io::Write::write_all(&mut w, &buf[..k]).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Espace libre du disque qui contient `p`.
+fn free_space(p: &Path) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let w: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let (mut free, mut total, mut tfree) = (0u64, 0u64, 0u64);
+        let ok = unsafe { GetDiskFreeSpaceExW(w.as_ptr(), &mut free, &mut total, &mut tfree) };
+        if ok != 0 { Some(free) } else { None }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = p;
+        None
+    }
+}
+
+/// Copie un fichier ou un dossier. L'élément choisi est suivi s'il s'agit d'un lien, mais à
+/// l'intérieur d'un dossier les liens et jonctions sont ignorés (sinon boucles, comme
+/// « Application Data » dans un profil, ou copie d'une cible énorme).
 fn copy_any(src: &Path, dst: &Path, cancel: &AtomicBool) -> std::io::Result<()> {
     let meta = std::fs::metadata(src)?;
-    if meta.is_dir() {
-        std::fs::create_dir_all(dst)?;
-        for e in std::fs::read_dir(src)? {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(std::io::Error::other("annulé"));
-            }
-            let e = e?;
-            copy_any(&e.path(), &dst.join(e.file_name()), cancel)?;
+    if meta.is_dir() { copy_dir(src, dst, cancel) } else { std::fs::copy(src, dst).map(|_| ()) }
+}
+
+fn copy_dir(src: &Path, dst: &Path, cancel: &AtomicBool) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for e in std::fs::read_dir(src)? {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("annulé"));
         }
-        Ok(())
-    } else {
-        // Sous Windows, std::fs::copy utilise CopyFileExW (rapide, garde les attributs).
-        std::fs::copy(src, dst).map(|_| ())
+        let e = e?;
+        let ft = e.file_type()?; // sans suivre les liens
+        let to = dst.join(e.file_name());
+        if ft.is_symlink() {
+            continue;
+        } else if ft.is_dir() {
+            copy_dir(&e.path(), &to, cancel)?;
+        } else {
+            // Sous Windows, std::fs::copy utilise CopyFileExW (rapide, garde les attributs).
+            std::fs::copy(e.path(), &to)?;
+        }
     }
+    Ok(())
 }
 
 fn zip_files(srcs: &[PathBuf], dst: &Path, cancel: &AtomicBool, progress: &dyn Fn(usize, usize, &Path)) -> std::io::Result<()> {
@@ -362,6 +453,12 @@ fn zip_files(srcs: &[PathBuf], dst: &Path, cancel: &AtomicBool, progress: &dyn F
         let mut stack = vec![s.clone()];
         while let Some(p) = stack.pop() {
             let rel = p.strip_prefix(base).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+            // Liens et jonctions à l'intérieur : ignorés (l'élément choisi, lui, est suivi).
+            let top = &p == s;
+            let is_link = std::fs::symlink_metadata(&p).map(|m| m.file_type().is_symlink()).unwrap_or(true);
+            if is_link && !top {
+                continue;
+            }
             if p.is_dir() {
                 items.push((p.clone(), format!("{rel}/")));
                 if let Ok(rd) = std::fs::read_dir(&p) {

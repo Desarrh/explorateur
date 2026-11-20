@@ -11,7 +11,18 @@ fn tmpdir(name: &str) -> PathBuf {
 }
 
 fn batch(paths: Vec<PathBuf>, pattern: &str, find: &str, replace: &str, regex: bool) -> BatchRename {
-    BatchRename { paths, pattern: pattern.into(), find: find.into(), replace: replace.into(), regex, start: 1, fresh: false }
+    BatchRename {
+        paths,
+        pattern: pattern.into(),
+        find: find.into(),
+        replace: replace.into(),
+        regex,
+        start: 1,
+        fresh: false,
+        preview: vec![],
+        conflicts: vec![],
+        preview_for: None,
+    }
 }
 
 #[test]
@@ -961,4 +972,51 @@ fn explorateur_par_defaut_registre() {
     assert_eq!(reg(r"Directory\shell").as_deref(), Some("autre-explorateur"), "ancienne valeur remise");
     assert_eq!(reg(r"Drive\shell").as_deref(), Some(""), "sans valeur d'avant : retirée");
     let _ = std::process::Command::new("reg").args(["delete", r"HKCU\Software\ExplorateurTest", "/f"]).output();
+}
+
+/// Audit n° 19 : une entrée « ../ » d'une archive ne sort jamais du dossier d'extraction.
+#[test]
+fn dezip_chemin_evade_ignore() {
+    use std::io::Write;
+    let d = tmpdir("zip-evade");
+    let z = d.join("piege.zip");
+    {
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&z).unwrap());
+        let o = zip::write::SimpleFileOptions::default();
+        w.start_file("../evadé.txt", o).unwrap();
+        w.write_all(b"dehors").unwrap();
+        w.start_file("dedans/ok.txt", o).unwrap();
+        w.write_all(b"ok").unwrap();
+        w.finish().unwrap();
+    }
+    let out = d.join("sortie");
+    let (err, _) = run_op(crate::ops::Op::Unzip { zip: z, dst: out.clone() });
+    assert!(err.is_empty(), "{err:?}");
+    assert_eq!(std::fs::read_to_string(out.join("dedans").join("ok.txt")).unwrap(), "ok");
+    assert!(!d.join("evadé.txt").exists(), "rien hors du dossier d'extraction");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Audit n° 19 : copier un dossier qui contient une jonction vers son parent ne boucle pas.
+#[test]
+fn copie_ignore_les_jonctions() {
+    let d = tmpdir("copie-jonction");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), "a").unwrap();
+    let ok = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(src.join("boucle"))
+        .arg(&d)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(ok, "jonction de test");
+    std::fs::create_dir_all(d.join("dst")).unwrap();
+    let (err, _) = run_op(crate::ops::Op::Copy { srcs: vec![src.clone()], dst: d.join("dst") });
+    assert!(err.is_empty(), "{err:?}");
+    assert_eq!(std::fs::read_to_string(d.join("dst").join("src").join("a.txt")).unwrap(), "a");
+    assert!(!d.join("dst").join("src").join("boucle").exists(), "jonction non copiée");
+    let _ = std::fs::remove_dir(src.join("boucle")); // retire la jonction, pas sa cible
+    let _ = std::fs::remove_dir_all(&d);
 }

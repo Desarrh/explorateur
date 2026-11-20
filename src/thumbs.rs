@@ -2,10 +2,11 @@
 //! Images (PNG, JPEG, WebP, AVIF, TIFF, SVG, PSD, HEIC via WIC…) : décodeurs du socle, avec
 //! cache disque QOI (%LOCALAPPDATA%\Explorateur\miniatures). Le reste (vidéos, PDF, Office, PSD, HEIC, pochettes MP3…) :
 //! le fournisseur de miniatures de Windows, exactement comme l'Explorateur.
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver};
 use egui::{ColorImage, TextureHandle, TextureOptions};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 
 type Key = (PathBuf, u32);
 
@@ -17,16 +18,22 @@ enum Slot {
 
 /// Les textures vivent en RAM (rendu CPU) : on garde un cache raisonnable.
 const MAX_SLOTS: usize = 700;
+/// Demandes en attente au plus : au-delà (défilement rapide), les plus anciennes sont oubliées
+/// et seront redemandées si elles reviennent à l'écran.
+const MAX_QUEUE: usize = 200;
+
+/// Pile de demandes : les workers prennent **la plus récente** (ce qui est à l'écran maintenant).
+type Queue = Arc<(Mutex<VecDeque<Key>>, Condvar)>;
 
 pub struct Thumbs {
-    tx: Sender<Key>,
+    queue: Queue,
     rx: Receiver<(Key, Option<ColorImage>)>,
     cache: HashMap<Key, Slot>,
 }
 
 impl Thumbs {
     pub fn new(ctx: &egui::Context) -> Self {
-        let (tx, req_rx) = unbounded::<Key>();
+        let queue: Queue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
         let (res_tx, rx) = unbounded();
         let disk = socle::images::DiskCache::for_app(crate::app::app_name());
         // Ménage du cache disque (500 Mo max), sans retarder le démarrage.
@@ -36,7 +43,7 @@ impl Thumbs {
         });
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 4);
         for _ in 0..workers {
-            let req_rx = req_rx.clone();
+            let queue = queue.clone();
             let res_tx = res_tx.clone();
             let ctx = ctx.clone();
             let disk = disk.clone();
@@ -45,7 +52,20 @@ impl Thumbs {
                 unsafe {
                     let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
                 }
-                while let Ok(key) = req_rx.recv() {
+                loop {
+                    let key = {
+                        let (lock, cv) = &*queue;
+                        let Ok(mut q) = lock.lock() else { break };
+                        loop {
+                            if let Some(k) = q.pop_back() {
+                                break k;
+                            }
+                            q = match cv.wait(q) {
+                                Ok(q) => q,
+                                Err(_) => return,
+                            };
+                        }
+                    };
                     let img = decode(&key.0, key.1, &disk);
                     if res_tx.send((key, img)).is_err() {
                         break;
@@ -54,7 +74,7 @@ impl Thumbs {
                 }
             });
         }
-        Thumbs { tx, rx, cache: HashMap::new() }
+        Thumbs { queue, rx, cache: HashMap::new() }
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
@@ -88,7 +108,16 @@ impl Thumbs {
                     self.cache.retain(|_, s| matches!(s, Slot::Pending));
                 }
                 self.cache.insert(key.clone(), Slot::Pending);
-                let _ = self.tx.send(key);
+                let (lock, cv) = &*self.queue;
+                if let Ok(mut q) = lock.lock() {
+                    q.push_back(key);
+                    while q.len() > MAX_QUEUE {
+                        if let Some(old) = q.pop_front() {
+                            self.cache.remove(&old); // plus « en attente » : redemandée si revue
+                        }
+                    }
+                }
+                cv.notify_one();
                 None
             }
         }

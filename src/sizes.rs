@@ -18,7 +18,7 @@ const KEEP_DEPTH: usize = 6;
 const MAX_CACHE: usize = 300_000;
 
 pub struct Sizes {
-    tx: Sender<(u64, Vec<PathBuf>)>,
+    tx: Sender<(u64, Vec<PathBuf>, Arc<HashMap<PathBuf, u64>>)>,
     rx: Receiver<Vec<(PathBuf, u64)>>,
     current: Arc<AtomicU64>,
     pub map: HashMap<PathBuf, u64>,
@@ -29,7 +29,7 @@ pub struct Sizes {
 
 impl Sizes {
     pub fn new(ctx: &egui::Context) -> Self {
-        let (tx, req_rx) = unbounded::<(u64, Vec<PathBuf>)>();
+        let (tx, req_rx) = unbounded::<(u64, Vec<PathBuf>, Arc<HashMap<PathBuf, u64>>)>();
         let (res_tx, rx) = unbounded();
         let current = Arc::new(AtomicU64::new(0));
         let cur = current.clone();
@@ -38,7 +38,7 @@ impl Sizes {
             // Disques SSD : beaucoup de lectures en parallèle paient.
             let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(4, 16);
             let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
-            while let Ok((g, dirs)) = req_rx.recv() {
+            while let Ok((g, dirs, known)) = req_rx.recv() {
                 if g != cur.load(Ordering::Relaxed) {
                     continue;
                 }
@@ -48,7 +48,7 @@ impl Sizes {
                 pool.install(|| {
                     dirs.par_iter().for_each(|d| {
                         let found = Mutex::new(Vec::new());
-                        if let Some(total) = walk(d, 0, g, &cur, &found) {
+                        if let Some(total) = walk(d, 0, g, &cur, &found, &known) {
                             let mut v = found.into_inner().unwrap_or_default();
                             v.push((d.clone(), total));
                             let _ = res_tx.send(v);
@@ -70,7 +70,10 @@ impl Sizes {
             return;
         }
         self.pending.extend(todo.iter().cloned());
-        let _ = self.tx.send((g, todo));
+        // Sous-dossiers déjà mesurés (sous le dossier affiché) : réutilisés tels quels par `walk`.
+        let parent = todo[0].parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let known: HashMap<PathBuf, u64> = self.map.iter().filter(|(k, _)| k.starts_with(&parent)).map(|(k, v)| (k.clone(), *v)).collect();
+        let _ = self.tx.send((g, todo, Arc::new(known)));
     }
 
     /// `true` si de nouvelles tailles sont arrivées.
@@ -120,15 +123,20 @@ impl Sizes {
 }
 
 /// Taille totale d'un dossier. `None` si annulé.
-fn walk(dir: &Path, depth: usize, g: u64, cur: &AtomicU64, found: &Mutex<Vec<(PathBuf, u64)>>) -> Option<u64> {
+fn walk(dir: &Path, depth: usize, g: u64, cur: &AtomicU64, found: &Mutex<Vec<(PathBuf, u64)>>, known: &HashMap<PathBuf, u64>) -> Option<u64> {
     if g != cur.load(Ordering::Relaxed) {
         return None;
     }
+    if depth > 0 {
+        if let Some(&s) = known.get(dir) {
+            return Some(s);
+        }
+    }
     let (files, subdirs) = list(dir);
     let sub: Option<u64> = if subdirs.len() > 1 {
-        subdirs.par_iter().map(|s| walk(s, depth + 1, g, cur, found)).try_reduce(|| 0, |a, b| Some(a + b))
+        subdirs.par_iter().map(|s| walk(s, depth + 1, g, cur, found, known)).try_reduce(|| 0, |a, b| Some(a + b))
     } else {
-        subdirs.iter().try_fold(0u64, |acc, s| walk(s, depth + 1, g, cur, found).map(|v| acc + v))
+        subdirs.iter().try_fold(0u64, |acc, s| walk(s, depth + 1, g, cur, found, known).map(|v| acc + v))
     };
     let total = files + sub?;
     if depth > 0 && depth <= KEEP_DEPTH {
@@ -218,6 +226,6 @@ pub fn bench(dir: &Path) -> (u64, usize, std::time::Duration) {
     let cur = AtomicU64::new(1);
     let found = Mutex::new(Vec::new());
     let t0 = std::time::Instant::now();
-    let total = walk(dir, 0, 1, &cur, &found).unwrap_or(0);
+    let total = walk(dir, 0, 1, &cur, &found, &HashMap::new()).unwrap_or(0);
     (total, found.into_inner().unwrap().len(), t0.elapsed())
 }

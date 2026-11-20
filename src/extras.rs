@@ -15,41 +15,49 @@ impl App {
         }
         let p = self.pal;
         let ctx = ui.ctx().clone();
-        // Candidats : dossiers visités, épinglés, accès rapide, disques, sous-dossiers du dossier courant.
-        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-        let mut cands: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-        for (k, (n, last)) in &self.s.visits {
-            let age_days = ((now - last).max(0) as f32) / 86_400.0;
-            let frec = (1.0 + *n as f32).ln() * 12.0 + 30.0 / (1.0 + age_days);
-            cands.insert(k.clone(), frec);
-        }
-        for path in self.s.pinned.iter().chain(self.quick.iter().map(|q| &q.1)) {
-            cands.entry(path.to_string_lossy().into_owned()).or_insert(8.0);
-        }
-        for d in &self.drives {
-            cands.entry(d.root.to_string_lossy().into_owned()).or_insert(2.0);
-        }
-        for e in self.tab().entries.iter().filter(|e| e.is_dir) {
-            cands.entry(e.path.to_string_lossy().into_owned()).or_insert(4.0);
+        // Candidats (dossiers visités, épinglés, accès rapide, disques, sous-dossiers) : notés et
+        // vérifiés sur le disque seulement quand la saisie change, pas à chaque image.
+        let q = self.goto.as_ref().map(|g| g.query.trim().to_lowercase()).unwrap_or_default();
+        if self.goto.as_ref().and_then(|g| g.folders_q.as_ref()) != Some(&q) {
+            // Candidats : dossiers visités, épinglés, accès rapide, disques, sous-dossiers du dossier courant.
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            let mut cands: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+            for (k, (n, last)) in &self.s.visits {
+                let age_days = ((now - last).max(0) as f32) / 86_400.0;
+                let frec = (1.0 + *n as f32).ln() * 12.0 + 30.0 / (1.0 + age_days);
+                cands.insert(k.clone(), frec);
+            }
+            for path in self.s.pinned.iter().chain(self.quick.iter().map(|q| &q.1)) {
+                cands.entry(path.to_string_lossy().into_owned()).or_insert(8.0);
+            }
+            for d in &self.drives {
+                cands.entry(d.root.to_string_lossy().into_owned()).or_insert(2.0);
+            }
+            for e in self.tab().entries.iter().filter(|e| e.is_dir) {
+                cands.entry(e.path.to_string_lossy().into_owned()).or_insert(4.0);
+            }
+            let mut scored: Vec<(f32, String)> = cands
+                .into_iter()
+                .filter_map(|(path, frec)| {
+                    if q.is_empty() {
+                        return Some((frec, path));
+                    }
+                    let low = path.to_lowercase();
+                    let base = Path::new(&path).file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+                    // Le nom du dossier compte plus que le chemin complet
+                    let s_base = socle::fuzzy::score(&base, &q).map(|s| s as f32 + 400.0);
+                    let s_full = socle::fuzzy::score(&low, &q).map(|s| s as f32);
+                    s_base.or(s_full).map(|s| (s + frec * 3.0, path))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let folders: Vec<String> = scored.into_iter().map(|x| x.1).filter(|p| Path::new(p).is_dir()).take(if q.len() >= 2 { 6 } else { 12 }).collect();
+            let g = self.goto.as_mut().unwrap();
+            g.folders = folders;
+            g.folders_q = Some(q.clone());
         }
         let g = self.goto.as_mut().unwrap();
-        let q = g.query.trim().to_lowercase();
-        let mut scored: Vec<(f32, String)> = cands
-            .into_iter()
-            .filter_map(|(path, frec)| {
-                if q.is_empty() {
-                    return Some((frec, path));
-                }
-                let low = path.to_lowercase();
-                let base = Path::new(&path).file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-                // Le nom du dossier compte plus que le chemin complet
-                let s_base = socle::fuzzy::score(&base, &q).map(|s| s as f32 + 400.0);
-                let s_full = socle::fuzzy::score(&low, &q).map(|s| s as f32);
-                s_base.or(s_full).map(|s| (s + frec * 3.0, path))
-            })
-            .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let folders: Vec<String> = scored.into_iter().map(|x| x.1).filter(|p| Path::new(p).is_dir()).take(if q.len() >= 2 { 6 } else { 12 }).collect();
+        let folders = g.folders.clone();
         // Index global : tous les fichiers des disques (recalculé seulement quand la saisie change)
         let (indexed, scanning) = match &self.index {
             Some(ix) => (ix.data.read().map(|d| d.len()).unwrap_or(0), ix.scanning.load(std::sync::atomic::Ordering::Relaxed)),
@@ -232,7 +240,7 @@ impl App {
         let mut open = false;
         let tex = if e.has_thumb() { self.thumbs.get(&e.path, 1600) } else { None };
         let text = if !e.is_dir && !e.has_thumb() && (fsx::is_text_ext(&e.ext) || e.size < 256 * 1024) {
-            fsx::read_text_preview(&e.path, 64 * 1024)
+            self.text_preview(&e.path, e.modified)
         } else {
             None
         };
@@ -264,7 +272,7 @@ impl App {
                 ui.painter().rect_filled(box_r, CornerRadius::same(10), self.pal.code);
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(box_r.shrink(16.0)));
                 egui::ScrollArea::both().id_salt("fv_text").auto_shrink([false, false]).show(&mut child, |ui| {
-                    ui.label(RichText::new(t).monospace().size(13.0).color(self.pal.text));
+                    ui.label(RichText::new(&**t).monospace().size(13.0).color(self.pal.text));
                 });
             } else {
                 let icon = crate::ui::entry_icon(&e);
@@ -302,24 +310,31 @@ impl App {
         let Some(b) = self.batch.as_mut() else { return };
         let p = self.pal;
         let ctx = ui.ctx().clone();
-        let names = batch_names(b);
-        // conflits : deux fois le même nom, ou un fichier existant hors sélection
-        let selected: std::collections::HashSet<&PathBuf> = b.paths.iter().collect();
-        let mut seen = std::collections::HashSet::new();
-        let conflicts: Vec<bool> = b
-            .paths
-            .iter()
-            .zip(&names)
-            .map(|(old, new)| match new {
-                Ok(n) => {
-                    let target = old.with_file_name(n);
-                    let dup = !seen.insert(target.to_string_lossy().to_lowercase());
-                    let exists = target.exists() && !selected.contains(&target);
-                    n.is_empty() || dup || exists || n.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|'])
-                }
-                Err(_) => true,
-            })
-            .collect();
+        // Aperçu recalculé seulement quand un champ change (regex, et un accès disque par fichier).
+        let key = (b.pattern.clone(), b.find.clone(), b.replace.clone(), b.regex, b.start);
+        if b.preview_for.as_ref() != Some(&key) {
+            b.preview = batch_names(b);
+            // conflits : deux fois le même nom, ou un fichier existant hors sélection
+            let selected: std::collections::HashSet<&PathBuf> = b.paths.iter().collect();
+            let mut seen = std::collections::HashSet::new();
+            b.conflicts = b
+                .paths
+                .iter()
+                .zip(&b.preview)
+                .map(|(old, new)| match new {
+                    Ok(n) => {
+                        let target = old.with_file_name(n);
+                        let dup = !seen.insert(target.to_string_lossy().to_lowercase());
+                        let exists = target.exists() && !selected.contains(&target);
+                        n.is_empty() || dup || exists || n.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|'])
+                    }
+                    Err(_) => true,
+                })
+                .collect();
+            b.preview_for = Some(key);
+        }
+        let names = b.preview.clone();
+        let conflicts = b.conflicts.clone();
         let ok = !conflicts.iter().any(|c| *c);
         let changed = b.paths.iter().zip(&names).filter(|(o, n)| n.as_ref().ok().map(|n| Some(n.as_str()) != o.file_name().and_then(|f| f.to_str())).unwrap_or(false)).count();
         let mut apply = false;

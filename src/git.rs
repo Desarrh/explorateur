@@ -113,9 +113,25 @@ impl Git {
         let (res_tx, rx) = unbounded();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            // Push (réseau, parfois long) sur son propre thread : le statut et les diffs continuent.
+            let spawn_push = |root: PathBuf| {
+                let (tx, ctx) = (res_tx.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send(handle(Req::Push(root)));
+                    ctx.request_repaint();
+                });
+            };
             while let Ok(mut req) = req_rx.recv() {
+                if let Req::Push(root) = req {
+                    spawn_push(root);
+                    continue;
+                }
                 // Garder seulement la dernière demande de statut/diff en attente.
                 while let Ok(next) = req_rx.try_recv() {
+                    if let Req::Push(root) = next {
+                        spawn_push(root);
+                        continue;
+                    }
                     let replaceable = matches!(req, Req::Status(_) | Req::Diff { .. } | Req::Detect(_));
                     if replaceable && std::mem::discriminant(&req) == std::mem::discriminant(&next) {
                         req = next;
@@ -665,11 +681,15 @@ fn status(root: PathBuf) -> Resp {
             stats.insert(p.to_string(), (a.parse().unwrap_or(0), d.parse().unwrap_or(0)));
         }
     }
+    // Lignes des nouveaux fichiers : les 200 premiers seulement (un dossier de build non ignoré en
+    // contient des milliers, qu'il faudrait tous relire à chaque statut).
+    let mut untracked_read = 0;
     for ch in &mut changes {
         if let Some((a, d)) = stats.get(&ch.rel) {
             ch.plus = Some(*a);
             ch.minus = Some(*d);
-        } else if ch.kind == Kind::Untracked {
+        } else if ch.kind == Kind::Untracked && untracked_read < 200 {
+            untracked_read += 1;
             if let Ok(m) = std::fs::metadata(root.join(&ch.rel)) {
                 if m.len() < 2_000_000 {
                     if let Ok(s) = std::fs::read(root.join(&ch.rel)) {

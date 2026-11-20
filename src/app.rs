@@ -250,7 +250,7 @@ pub struct Repo {
     pub by_path: HashMap<PathBuf, git::Kind>,
     pub loaded: bool,
     /// Règles .gitignore du dépôt (racine + .git/info/exclude) : filtrent le flux d'activité.
-    pub ignore: Option<ignore::gitignore::Gitignore>,
+    pub ignore: Option<Arc<ignore::gitignore::Gitignore>>,
 }
 
 impl Repo {
@@ -258,7 +258,7 @@ impl Repo {
         let mut b = ignore::gitignore::GitignoreBuilder::new(&root);
         let _ = b.add(root.join(".gitignore"));
         let _ = b.add(root.join(".git").join("info").join("exclude"));
-        let ignore = b.build().ok();
+        let ignore = b.build().ok().map(Arc::new);
         Repo {
             ignore,
             root,
@@ -368,6 +368,9 @@ pub struct Goto {
     /// Résultats de l'index global pour hits_q (recalculés seulement quand la saisie change).
     pub hits: Vec<(PathBuf, bool, String)>,
     pub hits_q: String,
+    /// Dossiers candidats pour `folders_q` (même principe).
+    pub folders: Vec<String>,
+    pub folders_q: Option<String>,
 }
 
 /// Renommage en lot.
@@ -380,6 +383,11 @@ pub struct BatchRename {
     pub regex: bool,
     pub start: u32,
     pub fresh: bool,
+    /// Aperçu (nouveaux noms, conflits) pour les champs `preview_for` : recalculé seulement quand
+    /// un champ change, pas à chaque image (regex, et un accès disque par fichier).
+    pub preview: Vec<Result<String, String>>,
+    pub conflicts: Vec<bool>,
+    pub preview_for: Option<(String, String, String, bool, u32)>,
 }
 
 enum LoadMsg {
@@ -421,7 +429,15 @@ pub struct App {
     drives_at: Instant,
     pub confirm: Option<Confirm>,
     pub actions: Vec<Action>,
-    pub preview_cache: Option<(PathBuf, Option<SystemTime>, Option<String>)>,
+    /// Début du fichier texte affiché en aperçu (chemin, date, texte), lu sur un thread.
+    pub preview_cache: Option<(PathBuf, Option<SystemTime>, Option<Arc<str>>)>,
+    preview_pending: Option<(PathBuf, Option<SystemTime>)>,
+    preview_tx: Sender<(PathBuf, Option<SystemTime>, Option<Arc<str>>)>,
+    preview_rx: Receiver<(PathBuf, Option<SystemTime>, Option<Arc<str>>)>,
+    /// Disques relus sur un thread (un disque en veille peut mettre des secondes à répondre).
+    drives_tx: Sender<Vec<fsx::Drive>>,
+    drives_rx: Receiver<Vec<fsx::Drive>>,
+    drives_busy: bool,
     pub show_help: bool,
     typeahead: (String, Instant),
     v_was_down: bool,
@@ -516,6 +532,8 @@ type Git2 = git::Git;
 impl App {
     pub fn new(ctx: &egui::Context, s: Settings) -> App {
         let ctx = ctx.clone();
+        let (ptx, prx) = unbounded();
+        let (dtx, drx) = unbounded();
         // Socle ≥ 0.1.3 : ni gras ni emoji par défaut (−13 Mo), Segoe UI Symbol gardé.
         theme::install_fonts(&ctx);
         let pal = theme::palette(s.dark);
@@ -630,11 +648,17 @@ impl App {
             diff_dirty: false,
             progress: None,
             toast: None,
-            drives: fsx::drives(),
+            drives: Vec::new(),
             drives_at: Instant::now(),
             confirm: None,
             actions: vec![],
             preview_cache: None,
+            preview_pending: None,
+            preview_tx: ptx,
+            preview_rx: prx,
+            drives_tx: dtx,
+            drives_rx: drx,
+            drives_busy: false,
             show_help: false,
             typeahead: (String::new(), Instant::now()),
             v_was_down: false,
@@ -659,6 +683,7 @@ impl App {
             app.index = Some(crate::index::Index::start(&ctx));
             app.start_recents();
         }
+        app.refresh_drives();
         // Explorateur par défaut actif mais exe déplacé : on réinscrit le bon chemin (hors du fil
         // de l'interface : registre + sonde de conteneur).
         #[cfg(windows)]
@@ -1070,6 +1095,13 @@ impl App {
             if noisy && !in_tab {
                 continue;
             }
+            // Fichier ignoré par git (build, cache…) : écarté avant tout accès au disque, sauf s'il
+            // est dans un dossier affiché. (Règles « dossier/ » : revérifiées plus bas pour un dossier.)
+            let in_repo = root.as_ref().map(|r| p.starts_with(r)).unwrap_or(false);
+            let ignored_path = in_repo && gi.as_ref().map(|g| g.matched_path_or_any_parents(&p, false).is_ignore()).unwrap_or(false);
+            if ignored_path && !in_tab {
+                continue;
+            }
             let exists = p.exists();
             let fin = match (exists, first) {
                 (false, Act::Created) => {
@@ -1089,13 +1121,12 @@ impl App {
             if self.preview_cache.as_ref().map(|c| c.0 == p).unwrap_or(false) {
                 self.preview_cache = None;
             }
-            let in_repo = root.as_ref().map(|r| p.starts_with(r)).unwrap_or(false);
-            // Fichier ignoré par git (build, cache…) : ni dans le flux d'activité, ni dans le statut.
-            let git_ignored = in_repo
-                && gi
-                    .as_ref()
-                    .map(|g| g.matched_path_or_any_parents(&p, exists && p.is_dir()).is_ignore())
-                    .unwrap_or(false);
+            // Ignoré par git : ni dans le flux d'activité, ni dans le statut.
+            let git_ignored = ignored_path
+                || (in_repo
+                    && exists
+                    && p.is_dir()
+                    && gi.as_ref().map(|g| g.matched_path_or_any_parents(&p, true).is_ignore()).unwrap_or(false));
             if git_ignored && !in_tab {
                 continue;
             }
@@ -1355,6 +1386,40 @@ impl App {
         }
     }
 
+    /// Relit les disques (espace libre) sur un thread.
+    pub fn refresh_drives(&mut self) {
+        if self.drives_busy {
+            return;
+        }
+        self.drives_busy = true;
+        let (tx, ctx) = (self.drives_tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(fsx::drives());
+            ctx.request_repaint();
+        });
+    }
+
+    /// Début d'un fichier texte pour l'aperçu : depuis le cache, sinon lu sur un thread (`None`
+    /// en attendant ; l'interface se redessine à l'arrivée).
+    pub fn text_preview(&mut self, path: &Path, modified: Option<SystemTime>) -> Option<Arc<str>> {
+        if let Some((p, m, t)) = &self.preview_cache {
+            if p == path && *m == modified {
+                return t.clone();
+            }
+        }
+        let key = (path.to_path_buf(), modified);
+        if self.preview_pending.as_ref() != Some(&key) {
+            self.preview_pending = Some(key);
+            let (tx, ctx, p) = (self.preview_tx.clone(), self.ctx.clone(), path.to_path_buf());
+            std::thread::spawn(move || {
+                let t = fsx::read_text_preview(&p, 64 * 1024).map(Arc::from);
+                let _ = tx.send((p, modified, t));
+                ctx.request_repaint();
+            });
+        }
+        None
+    }
+
     /// Demande le diff cumulé d'une passe (avant → après, ou avant → disque si elle est en cours).
     pub fn request_burst_diff(&mut self, id: u64) {
         let Some(b) = self.bursts.get(id) else { return };
@@ -1506,9 +1571,19 @@ impl App {
         self.tick_bursts();
         self.tick_recents();
         self.sync_watches();
+        while let Ok(d) = self.drives_rx.try_recv() {
+            self.drives = d;
+            self.drives_busy = false;
+        }
         if self.drives_at.elapsed() > Duration::from_secs(10) {
-            self.drives = fsx::drives();
             self.drives_at = Instant::now();
+            self.refresh_drives();
+        }
+        while let Ok((p, m, text)) = self.preview_rx.try_recv() {
+            if self.preview_pending.as_ref() == Some(&(p.clone(), m)) {
+                self.preview_pending = None;
+            }
+            self.preview_cache = Some((p, m, text));
         }
         // Taille des dossiers du dossier affiché (en arrière-plan) ; la carte de l'espace en a besoin aussi.
         if self.s.folder_sizes || (self.s.space_map && !self.s.dev) {
@@ -1545,8 +1620,14 @@ impl App {
         let live = self.tabs.iter().any(|t| !t.marks.is_empty());
         if live || self.toast.is_some() || self.progress.is_some() {
             self.ctx.request_repaint_after(Duration::from_millis(120));
-        } else if self.s.dev && !self.activity.is_empty() {
-            self.ctx.request_repaint_after(Duration::from_secs(1));
+        } else if self.s.dev {
+            // « il y a N s » : chaque seconde pendant la 1re minute, puis toutes les 30 s pendant une
+            // heure, puis plus rien (pas de redessin sans fin au repos).
+            match self.activity.front().map(|a| a.at.elapsed()) {
+                Some(e) if e < Duration::from_secs(60) => self.ctx.request_repaint_after(Duration::from_secs(1)),
+                Some(e) if e < Duration::from_secs(3600) => self.ctx.request_repaint_after(Duration::from_secs(30)),
+                _ => {}
+            }
         }
         // Dropped files from other apps → copy here
         let dropped: Vec<PathBuf> =
@@ -2100,7 +2181,7 @@ impl App {
             Action::Refresh => {
                 let i = self.active;
                 self.start_load(i);
-                self.drives = fsx::drives();
+                self.refresh_drives();
                 if let Some(r) = &self.repo {
                     self.git.send(git::Req::Status(r.root.clone()));
                 }
@@ -2244,7 +2325,7 @@ impl App {
                 self.ops.submit(if mv { Op::Move { srcs: sel, dst } } else { Op::Copy { srcs: sel, dst } });
             }
             Action::OpenGoto => {
-                self.goto = Some(Goto { query: String::new(), sel: 0, fresh: true, hits: vec![], hits_q: String::new() })
+                self.goto = Some(Goto { query: String::new(), sel: 0, fresh: true, hits: vec![], hits_q: String::new(), folders: vec![], folders_q: None })
             }
             Action::FullView(p) => {
                 let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -2266,6 +2347,9 @@ impl App {
                         regex: false,
                         start: 1,
                         fresh: true,
+                        preview: vec![],
+                        conflicts: vec![],
+                        preview_for: None,
                     });
                 }
             }

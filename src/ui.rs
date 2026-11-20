@@ -1213,11 +1213,7 @@ impl App {
             }
         }
         let text_preview = if !e.is_dir && !e.has_thumb() && (fsx::is_text_ext(&e.ext) || e.size < 64 * 1024) {
-            let stale = self.preview_cache.as_ref().map(|c| c.0 != e.path || c.1 != e.modified).unwrap_or(true);
-            if stale {
-                self.preview_cache = Some((e.path.clone(), e.modified, fsx::read_text_preview(&e.path, 24 * 1024)));
-            }
-            self.preview_cache.as_ref().and_then(|c| c.2.clone())
+            self.text_preview(&e.path, e.modified)
         } else {
             None
         };
