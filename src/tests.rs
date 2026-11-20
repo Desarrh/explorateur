@@ -4,7 +4,11 @@ use crate::extras::batch_names;
 use std::path::{Path, PathBuf};
 
 fn tmpdir(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("explorateur-test-{name}-{}", std::process::id()));
+    // Compteur : un même nom réutilisé (boucles) ne retombe jamais sur un dossier que Windows
+    // n'a pas encore fini d'effacer (.git verrouillé un instant après git).
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("explorateur-test-{name}-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -374,7 +378,7 @@ fn git_t(dir: &std::path::Path, args: &[&str]) -> String {
         .args(args)
         .output()
         .expect("git");
-    assert!(o.status.success(), "git {args:?} : {}", String::from_utf8_lossy(&o.stderr));
+    assert!(o.status.success(), "git {args:?} ({:?}) : {} {}", o.status, String::from_utf8_lossy(&o.stderr), String::from_utf8_lossy(&o.stdout));
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
