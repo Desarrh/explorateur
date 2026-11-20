@@ -1071,9 +1071,13 @@ impl App {
                 }
                 ui.menu_button("Convertir en", |ui| {
                     let same = |f: &str| f == e.ext || (f == "jpg" && e.ext == "jpeg") || (f == "tiff" && e.ext == "tif");
-                    for fmt in crate::viewer::targets(&e.ext).iter().filter(|f| !same(f)) {
-                        if ui.button(fmt.to_uppercase()).clicked() {
-                            acts.push(Action::Convert(fmt.to_string(), targets.clone()));
+                    // D'après le lecteur (--formats) s'il sait répondre, sinon la liste interne.
+                    for t in self.convert_targets(&e.ext).iter().filter(|t| !same(&t.ext)) {
+                        let label = if t.label.is_empty() { t.ext.to_uppercase() } else { t.label.clone() };
+                        let b = ui.button(label);
+                        let b = if t.detail.is_empty() { b } else { b.on_hover_text(&t.detail) };
+                        if b.clicked() {
+                            acts.push(Action::Convert(t.ext.clone(), targets.clone()));
                             ui.close();
                         }
                     }

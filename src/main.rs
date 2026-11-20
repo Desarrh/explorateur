@@ -53,6 +53,8 @@ struct Runner {
     next_repaint: Option<Instant>,
     /// Instance principale : écoute les instances suivantes une fois l'app créée.
     instance: Option<socle::instance::Instance>,
+    /// 1re image affichée (voir `socle::update::confirm_started`).
+    started: bool,
 }
 
 impl Runner {
@@ -86,6 +88,11 @@ impl Runner {
             gfx.renderer.render(&mut target, &prims, &out.textures_delta, out.pixels_per_point);
         }
         let _ = buf.present();
+        // 1re image affichée : la version (peut-être à l'essai après une mise à jour) est validée.
+        if !self.started {
+            self.started = true;
+            socle::update::confirm_started();
+        }
 
         // Glisser des fichiers vers le Bureau, Discord, etc. (glisser-déposer OLE de Windows)
         if let Some(paths) = app.drag_out.take() {
@@ -259,7 +266,13 @@ fn main() {
         socle::testmode::low_priority();
     }
     socle::crash::install(app::app_name(), env!("CARGO_PKG_VERSION"));
-    socle::update::cleanup_old();
+    // Mise à jour à l'essai : si cette version plante, ou démarre 2 fois sans afficher sa 1re
+    // image, l'ancienne est remise en place et relancée (et la version ratée n'est plus proposée).
+    socle::update::rollback_on_panic();
+    if socle::update::startup() == socle::update::Startup::RolledBack {
+        return;
+    }
+    socle::update::cleanup_old(); // (ne supprime rien pendant l'essai)
     // Relancé par une mise à jour : l'ancienne instance est en train de se fermer.
     // Relancé par une mise à jour : le socle ≥ 0.1.4 gère l'ancienne instance qui se ferme.
     let after_update = socle::update::is_after_update();
@@ -292,7 +305,7 @@ fn main() {
     ctx.set_request_repaint_callback(move |info| {
         let _ = p2.send_event(UserEvent::RepaintAt(Instant::now() + info.delay));
     });
-    let mut runner = Runner { ctx, proxy, gfx: None, app: None, settings: Some(app::Settings::load()), next_repaint: None, instance };
+    let mut runner = Runner { ctx, proxy, gfx: None, app: None, settings: Some(app::Settings::load()), next_repaint: None, instance, started: false };
     let _ = event_loop.run_app(&mut runner);
     let _ = &runner.proxy;
 }

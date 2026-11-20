@@ -25,7 +25,90 @@ pub fn handles(ext: &str) -> bool {
     !targets(ext).is_empty()
 }
 
-/// Formats de conversion proposés pour une extension (mêmes noms que `--convert`).
+/// Une cible de conversion (`--convert <ext>`).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct Target {
+    pub ext: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(serde::Deserialize)]
+struct FormatsAnswer {
+    #[serde(default)]
+    supported: bool,
+    #[serde(default)]
+    targets: Vec<Target>,
+}
+
+/// Le lecteur annonce ses options de ligne de commande dans sa ressource de version
+/// (`LecteurCli` = « formats apercu … »). Absente : lecteur ancien, on ne lui envoie rien de neuf
+/// (un ancien lecteur prendrait « --formats pdf » pour un fichier à ouvrir).
+#[cfg(windows)]
+pub fn cli_caps(exe: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+    let w: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    unsafe {
+        let size = GetFileVersionInfoSizeW(w.as_ptr(), std::ptr::null_mut());
+        if size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        if GetFileVersionInfoW(w.as_ptr(), 0, size, buf.as_mut_ptr() as *mut _) == 0 {
+            return None;
+        }
+        let query = |key: &str| -> Option<(*const u8, u32)> {
+            let k: Vec<u16> = key.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+            let mut len = 0u32;
+            (VerQueryValueW(buf.as_ptr() as *const _, k.as_ptr(), &mut ptr, &mut len) != 0 && !ptr.is_null()).then_some((ptr as *const u8, len))
+        };
+        // Langues déclarées, puis les plus courantes.
+        let mut langs: Vec<(u16, u16)> = Vec::new();
+        if let Some((p, len)) = query(r"\VarFileInfo\Translation") {
+            let pairs = std::slice::from_raw_parts(p as *const u16, (len / 2) as usize);
+            langs.extend(pairs.chunks_exact(2).map(|c| (c[0], c[1])));
+        }
+        langs.extend([(0x0000, 0x04B0), (0x0409, 0x04B0), (0x040C, 0x04B0)]);
+        for (l, c) in langs {
+            if let Some((p, len)) = query(&format!(r"\StringFileInfo\{l:04x}{c:04x}\LecteurCli")) {
+                let chars = std::slice::from_raw_parts(p as *const u16, len as usize);
+                let s = String::from_utf16_lossy(chars);
+                return Some(s.trim_end_matches('\0').to_string());
+            }
+        }
+        None
+    }
+}
+
+/// `lecteur --formats <ext>` : les conversions que ce lecteur sait faire (≈ 100 ms, à appeler sur
+/// un thread et à mettre en cache). `None` si la réponse est absente ou illisible.
+pub fn query_formats(exe: &Path, ext: &str) -> Option<Vec<Target>> {
+    let mut c = std::process::Command::new(exe);
+    c.arg("--formats").arg(ext);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000);
+    }
+    let o = c.output().ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&o.stdout);
+    let a: FormatsAnswer = serde_json::from_str(line.trim()).ok()?;
+    Some(if a.supported { a.targets } else { vec![] })
+}
+
+/// Liste interne (repli quand le lecteur ne sait pas répondre à `--formats`).
+pub fn fallback_targets(ext: &str) -> Vec<Target> {
+    targets(ext).iter().map(|e| Target { ext: e.to_string(), label: e.to_uppercase(), detail: String::new() }).collect()
+}
+
+/// Formats de conversion de la liste interne (mêmes noms que `--convert`).
 pub fn targets(ext: &str) -> &'static [&'static str] {
     match ext {
         "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "ico" | "tif" | "tiff" => &["png", "jpg", "webp", "bmp", "tiff", "ico", "gif"],

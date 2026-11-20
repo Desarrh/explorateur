@@ -460,6 +460,12 @@ pub struct App {
     pub batch: Option<BatchRename>,
     /// Exe du lecteur universel, s'il est installé.
     pub viewer: Option<PathBuf>,
+    /// Le lecteur sait répondre à `--formats` (lu dans sa ressource de version, sur un thread).
+    viewer_formats: Option<bool>,
+    /// Conversions par extension, d'après le lecteur (`None` : demande en cours).
+    formats: HashMap<String, Option<Vec<crate::viewer::Target>>>,
+    formats_tx: Sender<(String, Option<Vec<crate::viewer::Target>>)>,
+    formats_rx: Receiver<(String, Option<Vec<crate::viewer::Target>>)>,
     // --- autocomplétion (T4) ---
     pub filter_ac: socle::autocomplete::Autocomplete,
     pub filter_field: socle::ui::AutoField,
@@ -532,6 +538,7 @@ impl App {
     pub fn new(ctx: &egui::Context, s: Settings) -> App {
         let ctx = ctx.clone();
         let (ptx, prx) = unbounded();
+        let (ftx, frx) = unbounded();
         let (dtx, drx) = unbounded();
         // Socle ≥ 0.1.3 : ni gras ni emoji par défaut (−13 Mo), Segoe UI Symbol gardé.
         theme::install_fonts(&ctx);
@@ -603,7 +610,8 @@ impl App {
             index: None,
             recents_live: None,
             space_maps: HashMap::new(),
-            saver: socle::settings::Saver::new(Duration::from_secs(2)),
+            // écrit 300 ms après le dernier changement, au plus tard 2 s après le premier
+            saver: socle::settings::Saver::debounced(Duration::from_millis(300), Duration::from_secs(2)),
             settings_hash: 0,
             settings_checked: Instant::now(),
             recents_seen: 0,
@@ -653,6 +661,10 @@ impl App {
             actions: vec![],
             preview_cache: None,
             preview_pending: None,
+            viewer_formats: None,
+            formats: HashMap::new(),
+            formats_tx: ftx,
+            formats_rx: frx,
             preview_tx: ptx,
             preview_rx: prx,
             drives_tx: dtx,
@@ -702,10 +714,10 @@ impl App {
 
     /// Réglages enregistrés peu après chaque changement, sur un thread (socle::settings::Saver) :
     /// un plantage ne perd plus ce qui a changé depuis le lancement. Le changement est repéré par
-    /// une empreinte des réglages, calculée au plus toutes les 3 s et seulement quand l'interface
+    /// une empreinte des réglages, calculée au plus une fois par seconde et seulement quand l'interface
     /// se redessine (rien au repos).
     fn tick_settings(&mut self) {
-        if self.settings_checked.elapsed() >= Duration::from_secs(3) {
+        if self.settings_checked.elapsed() >= Duration::from_secs(1) {
             self.settings_checked = Instant::now();
             let h = settings_hash(self.settings_for_save());
             if h != self.settings_hash {
@@ -1385,6 +1397,46 @@ impl App {
         }
     }
 
+    /// Conversions proposées pour une extension : d'après le lecteur s'il sait répondre à
+    /// `--formats` (une demande par extension et par session, sur un thread), sinon la liste
+    /// interne. Pendant la demande, la liste interne s'affiche ; le menu se met à jour à l'arrivée.
+    pub fn convert_targets(&mut self, ext: &str) -> Vec<crate::viewer::Target> {
+        let Some(exe) = self.viewer.clone() else { return vec![] };
+        let fallback = || crate::viewer::fallback_targets(ext);
+        match self.viewer_formats {
+            None => {
+                // Capacité pas encore connue : on la lit (une fois) et on se sert du repli.
+                self.viewer_formats = Some(false);
+                let (tx, ctx) = (self.formats_tx.clone(), self.ctx.clone());
+                std::thread::spawn(move || {
+                    #[cfg(windows)]
+                    let ok = crate::viewer::cli_caps(&exe).map(|c| c.split_whitespace().any(|w| w == "formats")).unwrap_or(false);
+                    #[cfg(not(windows))]
+                    let ok = false;
+                    let _ = tx.send((String::new(), ok.then(Vec::new)));
+                    ctx.request_repaint();
+                });
+                fallback()
+            }
+            Some(false) => fallback(),
+            Some(true) => match self.formats.get(ext) {
+                Some(Some(t)) if !t.is_empty() => t.clone(),
+                Some(Some(_)) => vec![], // le lecteur ne convertit pas ce type
+                Some(None) => fallback(),
+                None => {
+                    self.formats.insert(ext.to_string(), None);
+                    let (tx, ctx, e) = (self.formats_tx.clone(), self.ctx.clone(), ext.to_string());
+                    std::thread::spawn(move || {
+                        let t = crate::viewer::query_formats(&exe, &e);
+                        let _ = tx.send((e, t));
+                        ctx.request_repaint();
+                    });
+                    fallback()
+                }
+            },
+        }
+    }
+
     /// Relit les disques (espace libre) sur un thread.
     pub fn refresh_drives(&mut self) {
         if self.drives_busy {
@@ -1577,6 +1629,13 @@ impl App {
         if self.drives_at.elapsed() > Duration::from_secs(10) {
             self.drives_at = Instant::now();
             self.refresh_drives();
+        }
+        while let Ok((ext, t)) = self.formats_rx.try_recv() {
+            if ext.is_empty() {
+                self.viewer_formats = Some(t.is_some()); // réponse sur la capacité
+            } else {
+                self.formats.insert(ext, Some(t.unwrap_or_default()));
+            }
         }
         while let Ok((p, m, text)) = self.preview_rx.try_recv() {
             if self.preview_pending.as_ref() == Some(&(p.clone(), m)) {
