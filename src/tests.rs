@@ -191,8 +191,6 @@ fn bench_index() {
     println!("  mémoire de l'index ≈ {} Mo", d.mem_bytes() / 1_000_000);
 }
 
-/// Tube inexistant : le test ne doit jamais parler au vrai lecteur s'il est en veille.
-const FAUX_TUBE: &str = r"\\.\pipe\explorateur-test-inexistant";
 
 #[test]
 fn apercu_rapide_repli_silencieux() {
@@ -200,12 +198,13 @@ fn apercu_rapide_repli_silencieux() {
     let f = PathBuf::from(r"C:\Windows\win.ini");
     // 1. lecteur introuvable → repli immédiat
     let (tx, rx) = crossbeam_channel::unbounded();
-    crate::viewer::quick_look_via(FAUX_TUBE, Path::new(r"C:\nexiste\pas\lecteur.exe"), &f, tx, ctx.clone());
+    let wait = std::time::Duration::from_secs(5); // large : le PC peut être chargé pendant les tests
+    crate::viewer::quick_look_within(Path::new(r"C:\nexiste\pas\lecteur.exe"), &f, tx, ctx.clone(), wait);
     assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(2)).ok(), Some(f.clone()));
     // 2. « lecteur » qui sort en erreur tout de suite (where.exe refuse --apercu) → repli
     let (tx, rx) = crossbeam_channel::unbounded();
-    crate::viewer::quick_look_via(FAUX_TUBE, Path::new(r"C:\Windows\System32\where.exe"), &f, tx, ctx);
-    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(3)).ok(), Some(f));
+    crate::viewer::quick_look_within(Path::new(r"C:\Windows\System32\where.exe"), &f, tx, ctx, wait);
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(8)).ok(), Some(f));
 }
 
 /// Mesure sans fenêtre (règle n°0 : rien à l'écran, aucun focus pris) : l'app complète tourne
@@ -215,6 +214,8 @@ fn apercu_rapide_repli_silencieux() {
 #[test]
 #[ignore]
 fn bench_affichage() {
+    // Mode test : nom d'app à part (journal de plantage, caches), jamais l'état de l'utilisateur.
+    unsafe { std::env::set_var("SOCLE_TEST", "1") };
     use egui_software_backend::{BufferMutRef, ColorFieldOrder, EguiSoftwareRender};
     let d = tmpdir("bench10k");
     for i in 0..10_000 {

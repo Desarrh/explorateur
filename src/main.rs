@@ -61,7 +61,9 @@ impl Runner {
         let size = gfx.window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
 
-        let raw = gfx.egui.take_egui_input(&gfx.window);
+        let mut raw = gfx.egui.take_egui_input(&gfx.window);
+        // Mode test : la fenêtre invisible n'a jamais le focus, le socle le simule pour egui.
+        socle::testmode::prepare_input(&mut raw);
         let out = self.ctx.run_ui(raw, |ui| {
             app.tick();
             app.handle_keys();
@@ -260,14 +262,12 @@ fn main() {
     socle::crash::install(app::app_name(), env!("CARGO_PKG_VERSION"));
     socle::update::cleanup_old();
     // Relancé par une mise à jour : l'ancienne instance est en train de se fermer.
+    // Relancé par une mise à jour : le socle ≥ 0.1.4 gère l'ancienne instance qui se ferme.
     let after_update = socle::update::is_after_update();
-    if after_update {
-        std::thread::sleep(std::time::Duration::from_millis(800));
-    }
     // Déjà ouvert ? Le dossier part à la fenêtre existante (nouvel onglet) et on s'arrête.
     let dir_arg: Vec<String> =
         std::env::args().skip(1).filter(|a| !a.starts_with("--")).take(1).filter(|a| std::path::Path::new(a).is_dir()).collect();
-    // (après une mise à jour, l'ancienne fenêtre a eu 0,8 s pour se fermer et rendre le mutex)
+    // (après une mise à jour, la nouvelle fenêtre démarre même si l'ancienne tient encore le mutex)
     let mut instance = None;
     match socle::instance::start(app::app_name(), &dir_arg) {
         socle::instance::Start::Forwarded if !after_update => return,

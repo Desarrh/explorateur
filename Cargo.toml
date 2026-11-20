@@ -27,7 +27,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win
 # Miniatures Windows (vidéos, PDF, Office…) via IShellItemImageFactory
 windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_Ole", "Win32_Foundation"] }
 # Socle commun des applis (thème, icônes, composants, images, réglages, instance, mise à jour)
-socle = { git = "https://github.com/Desarrh/socle", tag = "v0.1.2", default-features = false, features = ["ui", "images", "img-svg", "img-wic", "settings", "crash", "instance", "update", "testmode"] }
+socle = { git = "https://github.com/Desarrh/socle", tag = "v0.1.4", default-features = false, features = ["ui", "images", "img-svg", "img-wic", "settings", "crash", "instance", "update", "testmode"] }
 regex = "1.13.2"
 zip = { version = "9.7.3", default-features = false, features = ["deflate"] }
 rayon = "1.12.0"

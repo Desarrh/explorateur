@@ -254,7 +254,8 @@ pub struct Index {
 }
 
 fn index_file() -> Option<PathBuf> {
-    dirs::cache_dir().or_else(dirs::config_dir).map(|d| d.join("Explorateur").join("index.bin"))
+    // (en mode test : dossier « ExplorateurTest », jamais l'index de l'utilisateur)
+    dirs::cache_dir().or_else(dirs::config_dir).map(|d| d.join(crate::app::app_name()).join("index.bin"))
 }
 
 impl Index {

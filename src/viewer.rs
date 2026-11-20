@@ -39,23 +39,26 @@ pub fn targets(ext: &str) -> &'static [&'static str] {
 }
 
 /// Aperçu rapide (Espace) : `lecteur-universel --apercu <fichier>` (vue épurée, Échap/Espace ferment).
-/// Une version du lecteur sans ce mode ignore l'argument et ouvre le fichier normalement.
+/// Si l'aperçu du lecteur est déjà ouvert, ce 2ᵉ processus lui transmet le fichier par l'instance
+/// unique du socle et sort aussitôt : on ne parle jamais directement à son tube (son nom et son
+/// format changent avec la version du socle du lecteur ; la ligne de commande, elle, reste stable).
 /// Si le lancement échoue, ou si le lecteur sort en erreur dans la seconde, on envoie le fichier
 /// sur `fallback` : l'explorateur affiche alors son propre aperçu, sans message d'erreur.
 /// Rien ne bloque l'interface : l'attente se fait sur un thread.
 pub fn quick_look(viewer: &Path, file: &Path, fallback: crossbeam_channel::Sender<PathBuf>, ctx: egui::Context) {
-    quick_look_via(VIEWER_PIPE, viewer, file, fallback, ctx);
+    quick_look_within(viewer, file, fallback, ctx, std::time::Duration::from_millis(1200));
 }
 
-/// Même chose avec un nom de tube donné (les tests utilisent un tube qui n'existe pas).
-pub fn quick_look_via(pipe: &'static str, viewer: &Path, file: &Path, fallback: crossbeam_channel::Sender<PathBuf>, ctx: egui::Context) {
+/// Même chose avec le délai pendant lequel une sortie en erreur déclenche le repli (tests).
+pub fn quick_look_within(
+    viewer: &Path,
+    file: &Path,
+    fallback: crossbeam_channel::Sender<PathBuf>,
+    ctx: egui::Context,
+    wait: std::time::Duration,
+) {
     let (viewer, file) = (viewer.to_path_buf(), file.to_path_buf());
     std::thread::spawn(move || {
-        // Voie rapide : le lecteur tourne déjà (fenêtre d'aperçu en veille) → on lui écrit
-        // directement dans son tube nommé, sans lancer de processus (~20–30 ms de gagnés).
-        if send_to_pipe(pipe, &file) {
-            return;
-        }
         let child = std::process::Command::new(&viewer).arg("--apercu").arg(&file).spawn();
         let failed = match child {
             Err(_) => true,
@@ -63,12 +66,10 @@ pub fn quick_look_via(pipe: &'static str, viewer: &Path, file: &Path, fallback: 
                 let t0 = std::time::Instant::now();
                 loop {
                     match c.try_wait() {
-                        // Sortie rapide normale = fichier transmis à une instance déjà ouverte.
+                        // Sortie rapide normale = fichier transmis à l'aperçu déjà ouvert.
                         Ok(Some(status)) => break !status.success(),
-                        Ok(None) if t0.elapsed() < std::time::Duration::from_millis(1200) => {
-                            std::thread::sleep(std::time::Duration::from_millis(40));
-                        }
-                        Ok(None) => break false, // fenêtre ouverte : tout va bien
+                        Ok(None) if t0.elapsed() < wait => std::thread::sleep(std::time::Duration::from_millis(40)),
+                        Ok(None) => break false, // fenêtre d'aperçu ouverte : tout va bien
                         Err(_) => break true,
                     }
                 }
@@ -79,33 +80,6 @@ pub fn quick_look_via(pipe: &'static str, viewer: &Path, file: &Path, fallback: 
             ctx.request_repaint();
         }
     });
-}
-
-/// Tube de l'instance d'aperçu du lecteur (séparée de sa fenêtre de travail).
-/// Protocole : le chemin en UTF-8, une ligne, sans préfixe. Renvoie `false` si aucune instance
-/// d'aperçu n'écoute : on lancera alors l'exe avec `--apercu`.
-pub const VIEWER_PIPE: &str = r"\\.\pipe\lecteur-universel-apercu-v1";
-
-pub fn send_to_pipe(pipe: &str, file: &Path) -> bool {
-    use std::io::Write;
-    let t0 = std::time::Instant::now();
-    loop {
-        match std::fs::OpenOptions::new().write(true).open(pipe) {
-            Ok(mut f) => {
-                // Le lecteur doit pouvoir passer au premier plan : on lui cède ce droit.
-                #[cfg(windows)]
-                unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(u32::MAX); // ASFW_ANY
-                }
-                return f.write_all(file.to_string_lossy().as_bytes()).is_ok();
-            }
-            // Tube occupé (le serveur recrée son point d'écoute) : on réessaie un court instant.
-            Err(e) if e.raw_os_error() == Some(231) && t0.elapsed() < std::time::Duration::from_millis(60) => {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            Err(_) => return false,
-        }
-    }
 }
 
 pub fn open(viewer: &Path, files: &[PathBuf]) -> bool {

@@ -520,34 +520,14 @@ impl Settings {
     }
 }
 
-/// Polices du socle **sans** la police emoji (seguiemj.ttf, 13 Mo gardés en RAM) ni le gras
-/// (1 à 2 Mo, servait seulement au mot « PDF » de l'icône) : les icônes sont vectorielles et les
-/// rares pictogrammes (⬆ ✓) sont dans Segoe UI Symbol. RAM identique à avant la migration.
-fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    for (name, file, family, first) in [
-        ("segoe", "segoeui.ttf", egui::FontFamily::Proportional, true),
-        ("consolas", "consola.ttf", egui::FontFamily::Monospace, true),
-        ("segsym", "seguisym.ttf", egui::FontFamily::Proportional, false),
-    ] {
-        let Ok(b) = std::fs::read(format!(r"C:\Windows\Fonts\{file}")) else { continue };
-        fonts.font_data.insert(name.into(), egui::FontData::from_owned(b).into());
-        let list = fonts.families.entry(family).or_default();
-        if first { list.insert(0, name.into()) } else { list.push(name.into()) }
-    }
-    // Famille « bold » attendue par certains composants du socle : repli sur la police normale.
-    let prop = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
-    fonts.families.insert(egui::FontFamily::Name("bold".into()), prop);
-    ctx.set_fonts(fonts);
-}
-
 /// Petit alias pour garder le nom `git` libre pour le module.
 type Git2 = git::Git;
 
 impl App {
     pub fn new(ctx: &egui::Context, s: Settings) -> App {
         let ctx = ctx.clone();
-        install_fonts(&ctx);
+        // Socle ≥ 0.1.3 : ni gras ni emoji par défaut (−13 Mo), Segoe UI Symbol gardé.
+        theme::install_fonts(&ctx);
         let pal = theme::palette(s.dark);
         theme::apply(&ctx, &pal);
         ctx.all_styles_mut(|st| {
