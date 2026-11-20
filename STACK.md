@@ -10,7 +10,7 @@ Tout ce qui suit est relevé dans le code de `main` (commit `1cef86d`, version 0
 - **Ce qu'il remplace** : l'Explorateur Windows au quotidien (il peut devenir l'explorateur par défaut :
   Win+E et dossiers ouverts depuis le Bureau ou d'autres applis). Le Bureau et la barre des tâches restent à Windows.
 - **Principes** :
-  - léger : rendu CPU sans contexte GPU (~40–45 Mo de RAM, exe unique de ~13,7 Mo) ;
+  - léger : rendu CPU sans contexte GPU (~40–45 Mo de RAM, exe unique de ~14 Mo) ;
   - jamais bloquer l'interface : tout ce qui touche au disque, au réseau ou à git tourne sur des threads ;
   - pas de droits admin, pas d'installateur, réglages dans un simple fichier JSON ;
   - comportement Windows natif là où ça compte (presse-papiers, glisser-déposer, menu clic droit, miniatures).
@@ -48,9 +48,12 @@ Profil release : `lto = "thin"`, `codegen-units = 4`, `strip = true`. En dev, d�
 | `src/thumbs.rs` | Miniatures sur 2–4 threads (décodeurs du socle + cache disque QOI, sinon fournisseur Windows) |
 | `src/ops.rs` | File d'opérations (copie, déplacement, corbeille, zip, conversion) avec annulation |
 | `src/sizes.rs` | Taille des dossiers en parallèle (rayon + FindFirstFileExW), cache des sous-dossiers |
-| `src/index.rs` | Index global des noms de fichiers (Ctrl+P), sauvegardé sur disque |
-| `src/git.rs` | Statut, diff, commit, push, restauration (appels à `git` sans fenêtre console) |
-| `src/winx.rs` | Presse-papiers de fichiers, menu Windows natif, explorateur par défaut (registre HKCU), Claude Code, ouvrir avec, terminal |
+| `src/spacemap.rs` | Carte de l'espace disque (E3) : arbre lu sur un thread, disposition « en carrés », dessin et clics |
+| `src/index.rs` | Index global des noms de fichiers (Ctrl+P) avec date de modification, sauvegardé sur disque (`EXPLIDX2`) |
+| `src/recents.rs` | Récents partout (E2) : onglet virtuel `::Récents`, surveillance en direct des disques fixes, filtres de bruit |
+| `src/bursts.rs` | Rafales d'agent (E1) : regroupement des changements d'un dépôt en passes, instantanés avant/après |
+| `src/git.rs` | Statut, diff, commit, push, restauration ; instantanés des passes (index temporaire + `write-tree`) |
+| `src/winx.rs` | Presse-papiers de fichiers, glisser vers l'extérieur (`SHDoDragDrop`), menu Windows natif, explorateur par défaut (registre HKCU), Claude Code, ouvrir avec, terminal |
 | `src/viewer.rs` | Lien avec le lecteur universel (ouvrir, aperçu rapide par tube, `--convert`) |
 | `src/tests.rs` | Tests unitaires (`cargo test --release`) + 3 benchmarks ignorés (`bench_affichage` : 10 000 fichiers sans fenêtre) |
 
@@ -62,8 +65,10 @@ Les événements disque sont regroupés par image et appliqués en place à la l
 
 **Threads** : boucle UI (principal) ; 1 thread par chargement de dossier ; 2–4 miniatures ; 1 file
 d'opérations ; 1 git ; 1 pool rayon (4–16) pour les tailles ; 1 index ; pool `ignore` pour la recherche
-récursive ; watcher `notify` ; 1 écoute du tube d'instance (bloquante, 0 % CPU) ; 1 ménage du cache de
-miniatures au lancement ; threads ponctuels (mise à jour, candidats d'autocomplétion de la barre d'adresse).
+récursive ; watcher `notify` (onglets + dépôt) ; watcher `notify` récursif des disques fixes (récents, si la
+recherche globale est active) ; 1 écoute du tube d'instance (bloquante, 0 % CPU) ; 1 ménage du cache de
+miniatures au lancement ; threads ponctuels (mise à jour, candidats d'autocomplétion de la barre d'adresse,
+lecture de l'onglet « Récents », lecture de l'arbre de la carte de l'espace).
 Repaint demandé par les threads via `ctx.request_repaint()` → `EventLoopProxy`.
 
 ## 4. Direction artistique
@@ -142,7 +147,7 @@ renommage qui présélectionne le nom sans extension), lignes dessinées au `pai
 **Raccourcis** (liste complète avec F1 dans l'app) : Ctrl+T/W onglets, Ctrl+Tab, Ctrl+L chemin, Ctrl+F
 filtre, **Ctrl+K palette de commandes**, Ctrl+P aller à (dossiers et fichiers), Alt+←/→, Retour arrière (parent), Entrée ouvrir, F2 renommer (lot si plusieurs),
 Suppr / Maj+Suppr, Ctrl+C/X/V, Ctrl+Maj+C chemin, Ctrl+Maj+N dossier, Ctrl+A, Ctrl+H cachés,
-Ctrl+1/2 (et Ctrl+Maj+L / G) liste/grille, Ctrl+Maj+D Bureau/Dev, F3 double volet, F6 / Maj+F6 vers
+Ctrl+1/2/3 (et Ctrl+Maj+L / G / M) liste/grille/carte de l'espace, Ctrl+Maj+D Bureau/Dev, F3 double volet, F6 / Maj+F6 vers
 l'autre volet, Ctrl+Z annuler, Espace plein écran, F5, Maj+clic droit menu Windows, clic molette = nouvel
 onglet, lettres = aller au fichier. Ctrl+chiffre marche en AZERTY grâce à `socle::keys::consume_ctrl_digit`
 (touche physique).
@@ -165,6 +170,12 @@ installateur. `Explorateur.exe [dossier]`. Une 2ᵉ instance transmet le dossier
 `app::UPDATER`) : vérification de `https://api.github.com/repos/Desarrh/explorateur/releases/latest` une
 fois par 24 h, asset `*windows-x64.zip`, l'exe en cours est renommé `.old`, le nouveau le remplace, relance
 avec `--apres-maj` (la nouvelle instance attend 0,8 s que l'ancienne rende le mutex). En dev : `scripts\maj.ps1`.
+
+**Mode test (règle n° 0)** : `--test-hors-ecran` ou `SOCLE_TEST=1` → fenêtre invisible et sans focus
+(`socle::testmode::hide`), priorité basse, nom d'app `ExplorateurTest` (mutex, tube, cache, journal à part),
+réglages dans `%TEMP%\explorateur-test\`. Les tests visuels se font **sans fenêtre** : `tests::capture_png`
+(egui + rendu CPU dans un tampon → PNG), p. ex. `CAPTURE_DIR=<dossier> cargo test --release capture_ -- --ignored`.
+Un test ne surveille jamais les vrais disques ni l'instance de l'utilisateur.
 
 **Git** : auteur `Desarrh <175427122+Desarrh@users.noreply.github.com>`, pas de mention de Claude dans
 les commits. Dépôt public `Desarrh/explorateur`.
@@ -189,6 +200,15 @@ les commits. Dépôt public `Desarrh/explorateur`.
 - Zip / dézip, nouveau dossier/fichier, corbeille / suppression définitive, propriétés, ouvrir avec.
 - Menu Windows natif complet (sous-menus « Envoyer vers », « Ouvrir avec » câblés).
 - Vue Dev : changements git (+/−), cases de commit, diff, commit, push, restauration, flux d'activité.
+- **Rafales d'agent** (E1) : dans l'activité en direct, vue « Passes » : les changements faits d'affilée
+  (20 s de silence ferment une passe) sont regroupés ; diff cumulé de la passe dans le volet de droite,
+  « Annuler la passe » (état d'avant, fichiers créés à la corbeille) puis « Rétablir », Claude Code sur le
+  dépôt. Instantanés git sans toucher à l'index, à la branche ni à l'historique.
+- **Récents partout** (E2) : onglet « Récents » (barre latérale) — fichiers modifiés sur tous les disques
+  fixes, du plus récent au plus ancien, en direct ; AppData, Program Files, dossiers cachés, builds et
+  fichiers temporaires ignorés. Se comporte comme un dossier (ouvrir, aperçu, glisser, menu).
+- **Carte de l'espace disque** (E3) : 3ᵉ vue (Ctrl+3), rectangles proportionnels imbriqués sur 4 niveaux,
+  couleurs par type ; clic = entrer, survol = taille et part, clic droit = ouvrir / afficher / corbeille.
 - Explorateur par défaut (Win+E, dossiers), instance unique, thème clair/sombre, réglages persistants.
 - Lecteur universel : ouvrir les médias, « Convertir en » ; « Ouvrir Claude Code ici » dans l'app Claude.
 - Mise à jour automatique depuis GitHub, journal de plantage, icône et nom dans le Gestionnaire des tâches.
@@ -224,9 +244,19 @@ les commits. Dépôt public `Desarrh/explorateur`.
 - Git passe par la commande `git` (pas de `gix`) ; sous-dossiers `.gitignore` imbriqués ignorés dans le flux
   d'activité (seul le `.gitignore` racine + `.git/info/exclude`).
 - Exe non signé (SmartScreen au premier lancement).
-- Pas de tests d'interface (seulement des tests unitaires sur les opérations, l'index, les tailles).
+- Pas de tests d'interface automatiques (tests unitaires + captures sans fenêtre à regarder).
+- Rafales d'agent : seulement dans un dépôt git, et pas pendant « Pause » ; les instantanés écrivent des
+  objets git non référencés dans `.git/objects` (nettoyés par `git gc`) ; fichiers > 64 Mo ni copiés ni
+  restaurés ; une passe ouverte avant le premier instantané du dépôt n'a pas de diff.
+- Récents : sans la recherche globale, pas de récents ; dates de l'index rafraîchies toutes les 20 min, le
+  direct ne voit que ce qui change depuis le lancement ; un dépassement du tampon de ReadDirectoryChangesW
+  (rafale énorme) fait perdre quelques événements.
+- Carte de l'espace : 400 dossiers lus au plus par carte ; tailles de dossier issues de `sizes.rs` (sans
+  la MFT, donc plus lent que WizTree sur un disque entier).
+- Glisser vers l'extérieur (`SHDoDragDrop`) : objet de données testé, geste réel pas encore vérifié à la souris.
+- Test `apercu_rapide_repli_silencieux` sensible à la charge du PC (fenêtre de 1,2 s).
 
-## 9. Pistes QoL (non implémentées, à valider)
+## 9. Pistes QoL (à valider ; faites : 2, 6, 9)
 
 Deux types, marqués : **[Inédit]** (n'existe nulle part à notre connaissance) et **[Existe ailleurs]**
 (classique ailleurs, absent ici). Règle absolue : **tout doit être instantané**. Pour chaque piste,
@@ -238,7 +268,7 @@ Classées par utilité pour l'utilisateur (dev avec Claude, jeu, YouTube).
    ⚡ À chaque événement `notify` déjà reçu, on copie l'ancienne version des fichiers texte de moins de 1 Mo
    dans un magasin dédupliqué par hash (thread dédié, écriture différée) ; le curseur ne fait que lire un
    petit journal en mémoire ; rien n'est relu tant qu'on ne restaure pas.
-2. **[Inédit] Rafales d'agent** (S) — dev. Le flux d'activité regroupe automatiquement les changements
+2. ✅ **[Inédit] Rafales d'agent** (S) — dev. Le flux d'activité regroupe automatiquement les changements
    en « passes » (« 12 fichiers modifiés entre 14:32 et 14:34 ») avec, pour chaque passe : voir le diff
    cumulé, tout restaurer, ouvrir Claude Code dessus. ⚡ Simple regroupement des événements déjà en mémoire
    par silence de plus de 20 s ; diff calculé à la demande sur la passe affichée seulement.
@@ -257,7 +287,7 @@ Classées par utilité pour l'utilisateur (dev avec Claude, jeu, YouTube).
    miniatures existant (2–4 threads), seulement pour les cellules visibles ; cache disque des miniatures
    (clé = chemin + date + taille) pour qu'un dossier déjà vu s'affiche immédiatement au prochain passage ;
    pour le RAW on lit l'aperçu embarqué au lieu de développer l'image.
-6. **[Existe ailleurs] Récents partout** (S) — YouTube / dev. Une vue « modifiés récemment, tous disques »
+6. ✅ **[Existe ailleurs] Récents partout** (S) — YouTube / dev. Une vue « modifiés récemment, tous disques »
    (exports vidéo, captures OBS, téléchargements). ⚡ Tirée de l'index global (ajouter la date au nœud :
    +4 octets) et du flux `notify` ; tri partiel des 200 premiers seulement.
 7. **[Inédit] Arrivées apprises** (M) — YouTube / jeu. Quand un fichier arrive dans Téléchargements ou dans
@@ -269,7 +299,7 @@ Classées par utilité pour l'utilisateur (dev avec Claude, jeu, YouTube).
    (par toi ou un agent), le volet d'aperçu affiche un curseur avant/après pendant quelques minutes.
    ⚡ On garde la miniature précédente au lieu de la jeter quand le fichier change (déjà en cache) ; aucun
    décodage en plus.
-9. **[Existe ailleurs] Carte de l'espace disque** (M) — jeu. Treemap façon WizTree pour voir ce qui remplit
+9. ✅ **[Existe ailleurs] Carte de l'espace disque** (M) — jeu. Treemap façon WizTree pour voir ce qui remplit
    `J:\SteamLibrary` et nettoyer. ⚡ Construite à partir des tailles déjà calculées et mises en cache
    (`sizes.rs`) ; disposition calculée sur un thread, seulement à la profondeur affichée.
 10. **[Inédit] Carte de chaleur de tes fichiers** (S) — tous. Une teinte discrète sur les lignes selon la
