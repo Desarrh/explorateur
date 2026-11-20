@@ -371,11 +371,13 @@ fn glisser_objet_de_donnees_du_shell() {
 
 /// git dans un dossier de test (identité locale à la commande, rien dans la config de l'utilisateur).
 fn git_t(dir: &std::path::Path, args: &[&str]) -> String {
+    use std::os::windows::process::CommandExt;
     let o = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false"])
         .args(args)
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW : sa propre console, comme dans l'app
         .output()
         .expect("git");
     assert!(o.status.success(), "git {args:?} ({:?}) : {} {}", o.status, String::from_utf8_lossy(&o.stderr), String::from_utf8_lossy(&o.stdout));
