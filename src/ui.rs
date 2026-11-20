@@ -324,7 +324,11 @@ impl App {
             }
             ui.separator();
             ui.checkbox(&mut self.s.auto_update, "Chercher les mises à jour automatiquement");
-            if ui.button(format!("Vérifier les mises à jour (v{})", env!("CARGO_PKG_VERSION"))).clicked() {
+            if ui
+                .button(format!("Vérifier les mises à jour (v{})", env!("CARGO_PKG_VERSION")))
+                .on_hover_text(format!("Explorateur {} · socle {}", env!("CARGO_PKG_VERSION"), socle::VERSION))
+                .clicked()
+            {
                 self.actions.push(Action::CheckUpdate);
                 ui.close();
             }

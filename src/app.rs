@@ -463,6 +463,9 @@ pub struct App {
     pub index: Option<crate::index::Index>,
     /// Récents partout (E2) : surveillance en direct des disques fixes.
     pub recents_live: Option<crate::recents::Live>,
+    saver: socle::settings::Saver,
+    settings_hash: u64,
+    settings_checked: Instant,
     /// Carte de l'espace de chaque onglet (par id d'onglet).
     pub space_maps: HashMap<u64, crate::spacemap::MapState>,
     recents_seen: u64,
@@ -491,32 +494,19 @@ pub fn app_name() -> &'static str {
     if socle::testmode::enabled() { "ExplorateurTest" } else { APP }
 }
 
-/// En mode test, réglages dans un dossier temporaire.
-fn test_settings_path() -> Option<std::path::PathBuf> {
-    socle::testmode::enabled().then(|| std::env::temp_dir().join("explorateur-test").join("settings.json"))
-}
-
 /// Mise à jour depuis les releases GitHub (socle::update).
 pub const UPDATER: socle::update::Updater =
     socle::update::Updater { repo: "Desarrh/explorateur", current: env!("CARGO_PKG_VERSION"), asset_suffix: "windows-x64.zip", exe_name: None };
 
 impl Settings {
     /// `%APPDATA%\Explorateur\settings.json` (socle : même fichier qu'avant, écriture atomique).
+    /// (en mode test : réglages d'« ExplorateurTest », sans mise à jour automatique)
     pub fn load() -> Settings {
-        match test_settings_path() {
-            Some(p) => {
-                let mut s: Settings = socle::settings::load_from(&p);
-                s.auto_update = false;
-                s
-            }
-            None => socle::settings::load(APP),
+        let mut s: Settings = socle::settings::load(app_name());
+        if socle::testmode::enabled() {
+            s.auto_update = false;
         }
-    }
-    pub fn save(&self) {
-        let _ = match test_settings_path() {
-            Some(p) => socle::settings::save_to(&p, self),
-            None => socle::settings::save(APP, self),
-        };
+        s
     }
 }
 
@@ -596,6 +586,9 @@ impl App {
             index: None,
             recents_live: None,
             space_maps: HashMap::new(),
+            saver: socle::settings::Saver::new(Duration::from_secs(2)),
+            settings_hash: 0,
+            settings_checked: Instant::now(),
             recents_seen: 0,
             recents_loaded_at: Instant::now(),
             update: None,
@@ -681,6 +674,37 @@ impl App {
             app.toast(format!("L’explorateur s’est fermé brutalement la dernière fois ({msg}) — détails : {}", socle::crash::log_path(APP).display()), true);
         }
         app
+    }
+
+    /// Réglages enregistrés peu après chaque changement, sur un thread (socle::settings::Saver) :
+    /// un plantage ne perd plus ce qui a changé depuis le lancement. Le changement est repéré par
+    /// une empreinte des réglages, calculée au plus toutes les 3 s et seulement quand l'interface
+    /// se redessine (rien au repos).
+    fn tick_settings(&mut self) {
+        if self.settings_checked.elapsed() >= Duration::from_secs(3) {
+            self.settings_checked = Instant::now();
+            let h = settings_hash(self.settings_for_save());
+            if h != self.settings_hash {
+                self.settings_hash = h;
+                self.saver.touch();
+            }
+        }
+        if let Some(d) = self.saver.tick(app_name(), &self.s) {
+            self.ctx.request_repaint_after(d);
+        }
+        if let Some(e) = self.saver.take_error() {
+            self.toast(format!("Réglages non enregistrés : {e}"), true);
+        }
+    }
+
+    /// Fermeture : écrit les réglages (taille de fenêtre comprise) et attend la fin de l'écriture.
+    pub fn flush_settings(&mut self, window: Option<(f32, f32)>) {
+        self.settings_for_save();
+        if window.is_some() {
+            self.s.window = window;
+        }
+        self.saver.touch();
+        let _ = self.saver.flush(app_name(), &self.s);
     }
 
     pub fn settings_for_save(&mut self) -> &Settings {
@@ -1478,6 +1502,7 @@ impl App {
         self.process_watch();
         self.process_ops();
         self.process_git();
+        self.tick_settings();
         self.tick_bursts();
         self.tick_recents();
         self.sync_watches();
@@ -2359,7 +2384,7 @@ impl App {
                 },
                 UpdateMsg::Installed(Ok(())) => {
                     // La nouvelle version est lancée : on enregistre et on s'arrête.
-                    self.settings_for_save().clone().save();
+                    self.flush_settings(None);
                     std::process::exit(0);
                 }
                 UpdateMsg::Installed(Err(e)) => self.toast(format!("Mise à jour impossible : {e}"), true),
@@ -2422,4 +2447,12 @@ pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
             }
         }
     }
+}
+
+/// Empreinte des réglages (pour savoir s'il faut les réécrire).
+fn settings_hash(s: &Settings) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_vec(s).unwrap_or_default().hash(&mut h);
+    h.finish()
 }

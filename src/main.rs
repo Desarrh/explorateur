@@ -139,12 +139,11 @@ impl Runner {
 
     fn save(&mut self) {
         if let Some(app) = self.app.as_mut() {
-            let mut s = app.settings_for_save().clone();
-            if let Some(g) = &self.gfx {
+            let size = self.gfx.as_ref().map(|g| {
                 let sz = g.window.inner_size().to_logical::<f32>(g.window.scale_factor());
-                s.window = Some((sz.width, sz.height));
-            }
-            s.save();
+                (sz.width, sz.height)
+            });
+            app.flush_settings(size);
         }
     }
 }
