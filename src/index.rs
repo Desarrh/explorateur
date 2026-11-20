@@ -374,6 +374,7 @@ pub fn full_scan_for_test() -> (Data, Duration) {
     (d, t)
 }
 
+#[cfg(test)]
 impl Data {
     /// Mémoire occupée (approximative).
     pub fn mem_bytes(&self) -> usize {

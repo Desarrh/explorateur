@@ -12,6 +12,7 @@ Set-Location $root
 
 Write-Host "Compilation (release, priorité basse)..." -ForegroundColor Cyan
 $p = Start-Process cargo -ArgumentList 'build', '--release' -NoNewWindow -PassThru
+$null = $p.Handle # sans ça, PowerShell perd le code de sortie
 try { $p.PriorityClass = 'BelowNormal' } catch {}
 $p.WaitForExit()
 if ($p.ExitCode -ne 0) { Write-Host "La compilation a échoué : rien n'a été remplacé." -ForegroundColor Red; exit 1 }
