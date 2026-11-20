@@ -84,13 +84,17 @@ impl Runner {
 
         // Glisser des fichiers vers le Bureau, Discord, etc. (glisser-déposer OLE de Windows)
         if let Some(paths) = app.drag_out.take() {
-            let _ = drag::start_drag(
-                &*gfx.window,
-                drag::DragItem::Files(paths),
-                drag::Image::Raw(Vec::new()),
-                |_, _| {},
-                drag::Options::default(),
-            );
+            #[cfg(windows)]
+            {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(h) = gfx.window.window_handle() {
+                    if let RawWindowHandle::Win32(w) = h.as_raw() {
+                        if let Err(e) = winx::drag_files(w.hwnd.get(), &paths) {
+                            app.toast(format!("Glisser impossible : {e}"), true);
+                        }
+                    }
+                }
+            }
             // Le bouton a été relâché pendant le glisser Windows : on prévient egui.
             let input = gfx.egui.egui_input_mut();
             if let Some(pos) = self.ctx.input(|i| i.pointer.latest_pos()) {

@@ -219,6 +219,54 @@ pub mod default_explorer {
 }
 
 /// Le vrai menu clic droit de Windows (7-Zip, Git, « Envoyer vers », extensions…).
+/// Objet de données du Shell pour ces fichiers (CF_HDROP, noms, PIDL…), exactement celui que
+/// l'Explorateur fournit quand on glisse des fichiers. Accepte des fichiers de dossiers différents.
+#[cfg(windows)]
+pub fn shell_data_object(paths: &[PathBuf]) -> Result<windows::Win32::System::Com::IDataObject, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{BHID_DataObject, ILFree, SHCreateShellItemArrayFromIDLists, SHParseDisplayName};
+    use windows::core::PCWSTR;
+    unsafe {
+        let mut pidls: Vec<*mut ITEMIDLIST> = Vec::new();
+        for p in paths {
+            let w: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+            if SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut pidl, 0, None).is_ok() && !pidl.is_null() {
+                pidls.push(pidl);
+            }
+        }
+        let res = (|| {
+            if pidls.is_empty() {
+                return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG));
+            }
+            let consts: Vec<*const ITEMIDLIST> = pidls.iter().map(|p| *p as *const _).collect();
+            let arr = SHCreateShellItemArrayFromIDLists(&consts)?;
+            arr.BindToHandler(None, &BHID_DataObject)
+        })();
+        for p in pidls {
+            ILFree(Some(p));
+        }
+        res.map_err(|e| e.message())
+    }
+}
+
+/// Glisser des fichiers hors de la fenêtre (Bureau, Discord, navigateur…) : glisser-déposer OLE du
+/// Shell, avec sa source et son image de glissement par défaut. Bloquant jusqu'au dépôt.
+/// Remplace la crate `drag`, qui tirait d'anciennes versions de `windows`.
+#[cfg(windows)]
+pub fn drag_files(hwnd: isize, paths: &[PathBuf]) -> Result<(), String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, IDropSource};
+    use windows::Win32::UI::Shell::SHDoDragDrop;
+    let data = shell_data_object(paths)?;
+    unsafe {
+        SHDoDragDrop(Some(HWND(hwnd as *mut _)), &data, None::<&IDropSource>, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK)
+            .map(|_| ())
+            .map_err(|e| e.message())
+    }
+}
+
 /// Bloquant tant que le menu est ouvert, comme dans l'Explorateur.
 #[cfg(windows)]
 pub fn native_context_menu(hwnd: isize, paths: &[std::path::PathBuf]) -> Result<(), String> {

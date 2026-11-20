@@ -328,3 +328,27 @@ fn miniature_avec_cache_disque() {
     assert_eq!(crate::thumbs::decode(&png, 128, &disk).unwrap().size, [128, 64]);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn glisser_objet_de_donnees_du_shell() {
+    use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
+    let d = tmpdir("glisser");
+    let (a, b) = (d.join("a.txt"), d.join("sous").join("b.txt"));
+    std::fs::create_dir_all(b.parent().unwrap()).unwrap();
+    std::fs::write(&a, "a").unwrap();
+    std::fs::write(&b, "b").unwrap();
+    unsafe {
+        let _ = windows::Win32::System::Ole::OleInitialize(None);
+    }
+    // Fichiers de deux dossiers différents : l'objet doit proposer CF_HDROP (ce que lisent Bureau, Discord…).
+    let obj = crate::winx::shell_data_object(&[a, b]).expect("objet de données");
+    let fmt = FORMATETC {
+        cfFormat: windows::Win32::System::Ole::CF_HDROP.0,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    };
+    assert!(unsafe { obj.QueryGetData(&fmt) }.is_ok());
+    let _ = std::fs::remove_dir_all(&d);
+}

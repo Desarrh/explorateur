@@ -26,7 +26,7 @@ Tout ce qui suit est relevé dans le code de `main` (commit `1cef86d`, version 0
 | Fichiers | `notify` 8.2.2 (suivi live), `trash` 5.4.0 (corbeille + restauration), `open` 5.4.5, `zip` 9.7.3 (deflate), `ignore` 0.4.34 (parcours ripgrep, `.gitignore`), `rayon` 1.12.0, `memchr` 2.8.3 |
 | Socle commun | [`socle`](https://github.com/Desarrh/socle) v0.1.0 (tag git ; en local `.cargo/config.toml` le remplace par `../socle`, fichier ignoré par git), features `ui images img-svg img-wic settings crash instance update` : thème, icônes vectorielles, composants (champ avec autocomplétion, palette Ctrl+K, aide F1, contrôle segmenté), recherche floue, raccourcis (`keys`), miniatures + cache disque, réglages, journal de plantage, instance unique, mise à jour |
 | Images | décodeurs du socle (`socle::images` : png, jpeg, gif, webp, bmp, ico, tiff, qoi, svg, + tout ce que WIC sait lire : HEIC, AVIF, RAW…) ; `image` 0.25.10 reste pour l'icône de fenêtre et les tests |
-| Divers | `crossbeam-channel` 0.5.17, `serde`/`serde_json` 1, `chrono` 0.4.45, `dirs` 7.0.0, `regex` 1.13.2, `bytemuck` 1, `drag` 2.1.1 (glisser vers l'extérieur) |
+| Divers | `crossbeam-channel` 0.5.17, `serde`/`serde_json` 1, `chrono` 0.4.45, `dirs` 7.0.0, `regex` 1.13.2, `bytemuck` 1 |
 | API Windows | `windows-sys` 0.61.2 (FindFirstFileExW, GetDiskFreeSpaceExW, presse-papiers CF_HDROP, registre, ShellExecuteExW « properties », GetAsyncKeyState) et `windows` 0.62, comme le socle (IShellItemImageFactory pour les miniatures, IContextMenu/2/3 + SetWindowSubclass pour le menu natif, GDI) |
 | Build | `build.rs` + `winresource` 0.1.34 : icône `assets/icon.ico` et nom « Explorateur » intégrés à l'exe |
 | Outils externes (optionnels) | `git` (vue Dev), `curl.exe` (mises à jour, fourni avec Windows 10/11), Windows Terminal / PowerShell, VS Code (`code`), app Claude (lien `claude://code/new?folder=`), [lecteur universel](https://github.com/Desarrh/lecteur-universel) |
@@ -39,7 +39,7 @@ Profil release : `lto = "thin"`, `codegen-units = 4`, `strip = true`. En dev, d�
 
 | Fichier | Rôle |
 |---|---|
-| `src/main.rs` | Boucle winit, rendu CPU (egui → tessellation → rastériseur → softbuffer), glisser-sortir OLE, menu natif, journal de plantage, instance unique |
+| `src/main.rs` | Boucle winit, rendu CPU (egui → tessellation → rastériseur → softbuffer), glisser-sortir OLE, menu natif, mode test (`socle::testmode`) |
 | `src/app.rs` | État (`App`, `Tab`, `Repo`, `Settings`), actions (`enum Action`), suivi live, tri/filtre, git, raccourcis clavier |
 | `src/ui.rs` | Dessin : onglets, barre d'outils, barre latérale, liste et grille virtualisées, double volet, aperçu, vue Dev, fenêtres |
 | `src/extras.rs` | Palette « Aller à » (Ctrl+P), aperçu plein écran (Espace), renommage en lot |
@@ -217,8 +217,6 @@ les commits. Dépôt public `Desarrh/explorateur`.
   premier scan (désactivable). Pendant un rescan, l'ancien et le nouvel index coexistent.
 - Moteur de rendu CPU issu d'une petite crate tierce (`hdrshot-egui-backend`) : risque de bugs d'affichage.
 - Maj+clic pour étendre une sélection pas vérifié à la souris.
-- `drag` (glisser vers l'extérieur) tire encore d'anciennes versions de `windows` (0.52 / 0.58-core) en plus
-  de la 0.62 : un peu de taille d'exe en double.
 - Fonctions pas encore vérifiées à l'écran : Ctrl+P global, F6, zip depuis l'UI, sous-menus du menu natif,
   Claude Code dans l'app, explorateur par défaut, installation d'une mise à jour réelle.
 - Pas de lecture vidéo intégrée ; pas de miniatures sans le codec Windows correspondant.
