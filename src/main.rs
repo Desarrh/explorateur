@@ -2,6 +2,7 @@
 #![allow(deprecated)]
 
 mod app;
+mod bursts;
 mod commands;
 mod extras;
 mod fsx;

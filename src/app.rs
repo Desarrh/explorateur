@@ -278,6 +278,8 @@ impl Repo {
 pub enum Confirm {
     Delete(Vec<PathBuf>),
     Restore { rel: String, untracked: bool },
+    /// Restaurer toute une passe d'agent (E1).
+    BurstRestore(u64),
 }
 
 pub struct DragPaths(pub Vec<PathBuf>);
@@ -319,6 +321,10 @@ pub enum Action {
     SelectAll,
     GitSelect(String),
     GitRestoreAsk(String, bool),
+    /// Rafales d'agent : afficher le diff d'une passe, demander sa restauration, la rétablir.
+    BurstView(u64),
+    BurstRestoreAsk(u64),
+    BurstRedo(u64),
     GitCommit,
     GitPush,
     GitInit(PathBuf),
@@ -389,6 +395,14 @@ pub struct App {
     load_rx: Receiver<LoadMsg>,
     pub activity: VecDeque<Activity>,
     pub activity_paused: bool,
+    /// Rafales d'agent (E1) : passes, passe affichée dans le volet de diff, son diff.
+    pub bursts: crate::bursts::Bursts,
+    pub burst_view: Option<u64>,
+    pub burst_diff: Option<(u64, Vec<DiffLine>, u32, u32)>,
+    pub burst_dirty_at: Option<Instant>,
+    pub burst_expanded: HashSet<u64>,
+    /// Flux d'activité affiché par passes (sinon fichier par fichier).
+    pub activity_by_burst: bool,
     pub repo: Option<Repo>,
     repo_for: Option<PathBuf>,
     git_dirty_at: Option<Instant>,
@@ -613,6 +627,12 @@ impl App {
             load_rx,
             activity: VecDeque::new(),
             activity_paused: false,
+            bursts: Default::default(),
+            burst_view: None,
+            burst_diff: None,
+            burst_dirty_at: None,
+            burst_expanded: HashSet::new(),
+            activity_by_burst: true,
             repo: None,
             repo_for: None,
             git_dirty_at: None,
@@ -1021,6 +1041,13 @@ impl App {
                     Some(r) if in_repo => p.strip_prefix(r).map(|x| x.to_string_lossy().replace('\\', "/")).unwrap_or_default(),
                     _ => p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
                 };
+                if let (Some(r), true) = (&root, in_repo) {
+                    self.bursts.record(r, label.clone(), applied);
+                    let viewing_open = self.burst_view.and_then(|id| self.bursts.get(id)).map(|b| b.open()).unwrap_or(false);
+                    if viewing_open {
+                        self.burst_dirty_at.get_or_insert_with(Instant::now);
+                    }
+                }
                 if let Some(front) = self.activity.front_mut() {
                     if front.path == p && front.at.elapsed() < Duration::from_secs(4) {
                         front.count += 1;
@@ -1147,6 +1174,9 @@ impl App {
                     match root {
                         Some(root) => {
                             if self.repo.as_ref().map(|r| r.root != root).unwrap_or(true) {
+                                if let Some(q) = self.bursts.watch_repo(&root) {
+                                    self.git.send(git::Req::Snapshot { root: q.root, base: q.base, files: q.files, why: 0 });
+                                }
                                 self.repo = Some(Repo::new(root.clone()));
                                 self.git.send(git::Req::Status(root));
                             }
@@ -1186,6 +1216,36 @@ impl App {
                         }
                     }
                 }
+                git::Resp::Snapshot { root, why, tree, skipped } => {
+                    let w = if why == 0 { crate::bursts::SnapWhy::Base } else { crate::bursts::SnapWhy::Close(why) };
+                    self.bursts.on_snapshot(&root, w, tree, skipped);
+                    if why != 0 && self.burst_view == Some(why) {
+                        self.request_burst_diff(why);
+                    }
+                }
+                git::Resp::BurstDiff { id, lines, plus, minus } => {
+                    if self.burst_view == Some(id) {
+                        self.burst_diff = Some((id, lines, plus, minus));
+                    }
+                }
+                git::Resp::BurstRestored { root, id, redo, res } => {
+                    let n = self.bursts.get(id).map(|b| b.restorable().len()).unwrap_or(0);
+                    if let Some(b) = self.bursts.get_mut(id) {
+                        b.busy = false;
+                    }
+                    match res {
+                        Ok((undo, post)) => {
+                            if let Some(b) = self.bursts.get_mut(id) {
+                                b.undo = if redo { None } else { Some(undo) };
+                            }
+                            self.bursts.set_snapshot(&root, post);
+                            let msg = if redo { format!("Passe rétablie ({n} fichier(s))") } else { format!("Passe annulée : {n} fichier(s) remis comme avant") };
+                            self.toast(msg, false);
+                        }
+                        Err(e) => self.toast(format!("Restauration de la passe impossible : {e}"), true),
+                    }
+                    self.git.send(git::Req::Status(root));
+                }
                 git::Resp::Done { what, ok, msg, root } => {
                     if let Some(r) = self.repo.as_mut() {
                         r.busy = None;
@@ -1202,6 +1262,40 @@ impl App {
                     self.toast(if ok { format!("{what} réussi") } else { format!("{what} : {msg}") }, !ok);
                     self.git.send(git::Req::Status(root));
                 }
+            }
+        }
+    }
+
+    /// Demande le diff cumulé d'une passe (avant → après, ou avant → disque si elle est en cours).
+    pub fn request_burst_diff(&mut self, id: u64) {
+        let Some(b) = self.bursts.get(id) else { return };
+        let Some(before) = b.before.clone() else {
+            self.burst_diff = Some((id, vec![], 0, 0));
+            return;
+        };
+        let req = git::Req::BurstDiff { root: b.root.clone(), id, before, after: b.after.clone(), files: b.files.keys().cloned().collect() };
+        self.git.send(req);
+    }
+
+    fn tick_bursts(&mut self) {
+        for q in self.bursts.tick() {
+            let why = match q.why {
+                crate::bursts::SnapWhy::Close(id) => id,
+                crate::bursts::SnapWhy::Base => 0,
+            };
+            self.git.send(git::Req::Snapshot { root: q.root, base: q.base, files: q.files, why });
+        }
+        if let Some(d) = self.bursts.next_close_in() {
+            self.ctx.request_repaint_after(d + Duration::from_millis(50));
+        }
+        if let Some(t) = self.burst_dirty_at {
+            if t.elapsed() > Duration::from_millis(500) {
+                self.burst_dirty_at = None;
+                if let Some(id) = self.burst_view {
+                    self.request_burst_diff(id);
+                }
+            } else {
+                self.ctx.request_repaint_after(Duration::from_millis(520));
             }
         }
     }
@@ -1318,6 +1412,7 @@ impl App {
         self.process_watch();
         self.process_ops();
         self.process_git();
+        self.tick_bursts();
         self.sync_watches();
         if self.drives_at.elapsed() > Duration::from_secs(10) {
             self.drives = fsx::drives();
@@ -1930,12 +2025,24 @@ impl App {
                 }
             }
             Action::GitSelect(rel) => {
+                self.burst_view = None;
                 if let Some(r) = self.repo.as_mut() {
                     r.selected = Some(rel);
                 }
                 self.request_diff();
             }
             Action::GitRestoreAsk(rel, untracked) => self.confirm = Some(Confirm::Restore { rel, untracked }),
+            Action::BurstView(id) => {
+                if self.burst_view == Some(id) {
+                    self.burst_view = None;
+                } else {
+                    self.burst_view = Some(id);
+                    self.burst_diff = None;
+                    self.request_burst_diff(id);
+                }
+            }
+            Action::BurstRestoreAsk(id) => self.confirm = Some(Confirm::BurstRestore(id)),
+            Action::BurstRedo(id) => self.restore_burst(id, true),
             Action::GitCommit => {
                 if let Some(r) = self.repo.as_mut() {
                     let files = r.included();
@@ -2087,8 +2194,25 @@ impl App {
                     self.git.send(git::Req::Restore { root: r.root.clone(), rel, untracked });
                 }
             }
+            Some(Confirm::BurstRestore(id)) => self.restore_burst(id, false),
             None => {}
         }
+    }
+
+    /// Annule une passe (remet ses fichiers dans l'état d'avant) ou la rétablit (`redo`).
+    fn restore_burst(&mut self, id: u64, redo: bool) {
+        let Some(b) = self.bursts.get(id) else { return };
+        let to = if redo { b.undo.clone() } else { b.before.clone() };
+        let (Some(to), Some(base)) = (to, self.bursts.snapshot_of(&b.root)) else {
+            self.toast("Pas d’instantané git pour cette passe : restauration impossible", true);
+            return;
+        };
+        let (root, files) = (b.root.clone(), b.restorable());
+        self.bursts.mute(&root, &files);
+        if let Some(b) = self.bursts.get_mut(id) {
+            b.busy = true;
+        }
+        self.git.send(git::Req::BurstRestore { root, id, to, base, files, redo });
     }
 
     #[cfg(windows)]

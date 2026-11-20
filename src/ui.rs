@@ -1415,9 +1415,20 @@ impl App {
                 if ui.button(label).clicked() {
                     self.activity_paused = !self.activity_paused;
                 }
+                if self.repo.is_some() {
+                    // (disposition de droite à gauche : éléments inversés)
+                    let mut seg = if self.activity_by_burst { 1 } else { 0 };
+                    if socle::ui::segmented(ui, &p, &mut seg, &[(None, "Fichiers"), (None, "Passes")]) {
+                        self.activity_by_burst = seg == 1;
+                    }
+                }
             });
         });
         ui.add_space(4.0);
+        if self.activity_by_burst && self.repo.is_some() {
+            self.draw_bursts(ui);
+            return;
+        }
         if self.activity.is_empty() {
             ui.label(RichText::new("Aucun changement pour l’instant. Les fichiers modifiés par Claude ou un autre outil s’afficheront ici en temps réel.").color(p.muted));
             return;
@@ -1493,6 +1504,13 @@ impl App {
                     ui.label(RichText::new(m).size(12.0).color(if *ok { p.add } else { p.del }));
                 }
             });
+        // Passe d'agent affichée : son diff cumulé remplace celui du fichier.
+        if let Some(id) = self.burst_view.filter(|id| self.bursts.get(*id).is_some()) {
+            self.draw_burst_diff(ui, id, &mut acts);
+            self.actions.extend(acts);
+            return;
+        }
+        let Some(repo) = self.repo.as_mut() else { return };
         // En-tête du fichier
         let sel = repo.selected.clone();
         egui::Panel::top("diff_head")
@@ -1535,30 +1553,161 @@ impl App {
                 ui.vertical_centered(|ui| ui.label(RichText::new("Pas de différence texte (fichier binaire ou vide)").color(p.muted)));
                 return;
             }
-            let line_h = 19.0;
-            let font = FontId::monospace(12.5);
-            let max_chars = repo.diff.iter().map(|l| l.text.len()).max().unwrap_or(40);
-            let width = (max_chars as f32 * 7.4 + 110.0).max(ui.available_width());
-            egui::ScrollArea::both().auto_shrink([false, false]).id_salt("diff_scroll").show_rows(ui, line_h, repo.diff.len(), |ui, range| {
-                ui.set_min_width(width);
-                for i in range {
-                    let l = &repo.diff[i];
-                    let (rect, _) = ui.allocate_exact_size(vec2(width, line_h), Sense::hover());
-                    let (bg, fg, sign) = match l.kind {
-                        LineKind::Add => (p.add_bg, p.add, "+"),
-                        LineKind::Del => (p.del_bg, p.del, "−"),
-                        LineKind::Hunk => (p.soft, p.muted, ""),
-                        LineKind::Ctx => (Color32::TRANSPARENT, p.text, ""),
-                    };
-                    ui.painter().rect_filled(rect, CornerRadius::ZERO, bg);
-                    let no = l.new_no.or(l.old_no).map(|n| n.to_string()).unwrap_or_default();
-                    ui.painter().text(pos2(rect.left() + 44.0, rect.center().y), Align2::RIGHT_CENTER, no, font.clone(), p.muted);
-                    ui.painter().text(pos2(rect.left() + 56.0, rect.center().y), Align2::LEFT_CENTER, sign, font.clone(), fg);
-                    let text = l.text.replace('\t', "    ");
-                    ui.painter().text(pos2(rect.left() + 72.0, rect.center().y), Align2::LEFT_CENTER, text, font.clone(), fg);
+            diff_view(ui, &p, &repo.diff, "diff_scroll");
+        });
+        self.actions.extend(acts);
+    }
+
+    /// Volet de droite quand une passe d'agent est affichée : en-tête + diff cumulé.
+    fn draw_burst_diff(&mut self, ui: &mut Ui, id: u64, acts: &mut Vec<Action>) {
+        let p = self.pal;
+        let Some(b) = self.bursts.get(id) else { return };
+        let (n, busy, undone, can) = (b.files.len(), b.busy, b.undo.is_some(), b.closed && b.before.is_some());
+        let when = burst_when(b);
+        let stats = self.burst_diff.as_ref().filter(|d| d.0 == id).map(|d| (d.2, d.3));
+        egui::Panel::top("burst_head").frame(Frame::new().fill(p.code).inner_margin(Margin::symmetric(14, 10))).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Passe {when}")).strong());
+                ui.label(RichText::new(format!("{n} fichier(s)")).color(p.muted).size(12.0));
+                if let Some((a, d)) = stats {
+                    ui.label(RichText::new(format!("+{a}")).color(p.add).size(12.0));
+                    ui.label(RichText::new(format!("−{d}")).color(p.del).size(12.0));
                 }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if icons::button(ui, Icon::Close, 26.0, Look::tool(&p), "Fermer le diff de la passe").clicked() {
+                        acts.push(Action::BurstView(id));
+                    }
+                    if busy {
+                        ui.spinner();
+                    } else if undone {
+                        if ui.button("Rétablir").on_hover_text("Remettre les fichiers comme à la fin de la passe").clicked() {
+                            acts.push(Action::BurstRedo(id));
+                        }
+                    } else if can && ui.button("Annuler la passe").on_hover_text("Remettre tous ses fichiers dans l’état d’avant").clicked() {
+                        acts.push(Action::BurstRestoreAsk(id));
+                    }
+                });
             });
         });
+        egui::CentralPanel::default().frame(Frame::new().fill(p.code)).show(ui, |ui| match &self.burst_diff {
+            Some((i, lines, _, _)) if *i == id => {
+                if lines.is_empty() {
+                    ui.add_space(20.0);
+                    ui.vertical_centered(|ui| ui.label(RichText::new("Pas de différence texte (fichiers binaires, ou passe sans instantané git)").color(p.muted)));
+                } else {
+                    diff_view(ui, &p, lines, "burst_diff_scroll");
+                }
+            }
+            _ => {
+                ui.add_space(20.0);
+                ui.vertical_centered(|ui| ui.label(RichText::new("Calcul du diff de la passe…").color(p.muted)));
+            }
+        });
+    }
+
+    /// Passes d'agent (E1) : une ligne par passe, dépliable ; un clic affiche son diff cumulé.
+    fn draw_bursts(&mut self, ui: &mut Ui) {
+        let p = self.pal;
+        let Some(root) = self.repo.as_ref().map(|r| r.root.clone()) else { return };
+        let ids: Vec<u64> = self.bursts.list.iter().filter(|b| b.root == root).map(|b| b.id).collect();
+        if ids.is_empty() {
+            ui.label(
+                RichText::new("Aucune passe pour l’instant. Les fichiers modifiés d’affilée (par Claude ou un autre outil) sont regroupés ici ; une passe se termine après 20 s sans écriture.")
+                    .color(p.muted),
+            );
+            return;
+        }
+        let mut acts = Vec::new();
+        let mut toggle = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("bursts").show(ui, |ui| {
+            for id in ids {
+                let Some(b) = self.bursts.get(id) else { continue };
+                let open = b.open();
+                let expanded = self.burst_expanded.contains(&id);
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
+                let bg = if self.burst_view == Some(id) {
+                    p.sel_bg
+                } else if resp.hovered() {
+                    p.hover_bg
+                } else if open {
+                    blend(p.soft, p.live_bg, 0.8)
+                } else {
+                    p.soft
+                };
+                ui.painter().rect_filled(rect.shrink2(vec2(0.0, 2.0)), CornerRadius::same(6), bg);
+                if open {
+                    let bar = Rect::from_min_size(pos2(rect.left(), rect.top() + 6.0), vec2(3.0, rect.height() - 12.0));
+                    ui.painter().rect_filled(bar, CornerRadius::same(1), p.live);
+                }
+                let cy = rect.center().y;
+                paint_icon(ui, pos2(rect.left() + 16.0, cy), 14.0, if expanded { Icon::ChevronDown } else { Icon::ChevronRight }, p.muted);
+                paint_text_left(ui, rect, rect.left() + 30.0, &burst_when(b), FontId::monospace(12.0), p.text, 170.0);
+                let count = |k: fn(&Act) -> bool| b.files.values().filter(|a| k(a)).count();
+                let (c, m, r) = (count(|a| matches!(a, Act::Created)), count(|a| matches!(a, Act::Modified)), count(|a| matches!(a, Act::Removed)));
+                let mut parts = vec![format!("{} fichier(s)", b.files.len())];
+                if m > 0 {
+                    parts.push(format!("{m} modifié(s)"));
+                }
+                if c > 0 {
+                    parts.push(format!("{c} créé(s)"));
+                }
+                if r > 0 {
+                    parts.push(format!("{r} supprimé(s)"));
+                }
+                let status = if b.busy {
+                    "…"
+                } else if b.undo.is_some() {
+                    "annulée"
+                } else if open {
+                    "en cours"
+                } else {
+                    ""
+                };
+                paint_text_left(ui, rect, rect.left() + 205.0, &parts.join(" · "), FontId::proportional(12.5), p.text, (rect.width() - 330.0).max(40.0));
+                let col = if open { p.live } else { p.muted };
+                paint_text_right(ui, rect, rect.right() - 40.0, status, FontId::proportional(12.0), col);
+                // Claude Code sur le dépôt (à droite de la ligne)
+                let br = Rect::from_center_size(pos2(rect.right() - 18.0, cy), vec2(26.0, 26.0));
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(br));
+                if icons::button(&mut child, Icon::Command, 24.0, Look::tool(&p), "Ouvrir Claude Code sur ce dépôt").clicked() {
+                    acts.push(Action::ClaudeHere(root.clone()));
+                }
+                if resp.clicked() {
+                    toggle = Some(id);
+                    if self.burst_view != Some(id) {
+                        acts.push(Action::BurstView(id));
+                    }
+                }
+                resp.on_hover_text("Clic : fichiers de la passe et diff cumulé à droite");
+                if expanded {
+                    for (rel, a) in b.files.iter().take(500) {
+                        let (fr, fresp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+                        if fresp.hovered() {
+                            ui.painter().rect_filled(fr, CornerRadius::same(4), p.hover_bg);
+                        }
+                        let kc = match a {
+                            Act::Created => p.add,
+                            Act::Removed => p.del,
+                            Act::Modified => p.live,
+                        };
+                        paint_text_left(ui, fr, fr.left() + 34.0, rel, FontId::monospace(12.0), p.text, fr.width() - 140.0);
+                        paint_text_right(ui, fr, fr.right() - 10.0, a.label(), FontId::proportional(12.0), kc);
+                        if fresp.clicked() {
+                            acts.push(Action::GitSelect(rel.clone()));
+                        }
+                        if fresp.double_clicked() && !matches!(a, Act::Removed) {
+                            acts.push(Action::ShowInFolder(root.join(rel.replace('/', "\\"))));
+                        }
+                    }
+                    ui.add_space(4.0);
+                }
+            }
+        });
+        if let Some(id) = toggle {
+            if !self.burst_expanded.remove(&id) {
+                self.burst_expanded.insert(id);
+            }
+        }
         self.actions.extend(acts);
     }
 
@@ -1601,6 +1750,21 @@ impl App {
                 },
                 "Restaurer",
             ),
+            Confirm::BurstRestore(id) => {
+                let (n, created) = self
+                    .bursts
+                    .get(*id)
+                    .map(|b| (b.restorable().len(), b.files.values().filter(|a| matches!(a, Act::Created)).count()))
+                    .unwrap_or((0, 0));
+                (
+                    "Annuler toute la passe ?",
+                    format!(
+                        "{n} fichier(s) reviennent à leur état d’avant la passe{}. Tu pourras la rétablir ensuite.",
+                        if created > 0 { format!(" ({created} fichier(s) créés partent à la corbeille)") } else { String::new() }
+                    ),
+                    "Annuler la passe",
+                )
+            }
         };
         let mut answer = None;
         let ctx = ui.ctx().clone();
@@ -1672,4 +1836,42 @@ fn paint_galley_right(ui: &Ui, rect: Rect, right: f32, text: &str, color: Color3
     let y = rect.center().y - g.size().y / 2.0;
     ui.painter().galley(pos2(right - w, y), g, color);
     right - w
+}
+
+/// « 14:32:05 → 14:34:10 » (ou « → en cours »).
+fn burst_when(b: &crate::bursts::Burst) -> String {
+    let t = |t: std::time::SystemTime| chrono::DateTime::<chrono::Local>::from(t).format("%H:%M:%S").to_string();
+    if b.open() { format!("{} → en cours", t(b.start)) } else { format!("{} → {}", t(b.start), t(b.end)) }
+}
+
+/// Lignes d'un diff (fichier seul ou passe de plusieurs fichiers), virtualisées.
+fn diff_view(ui: &mut Ui, p: &socle::theme::Palette, lines: &[crate::git::DiffLine], salt: &str) {
+    let line_h = 19.0;
+    let font = FontId::monospace(12.5);
+    let max_chars = lines.iter().map(|l| l.text.len()).max().unwrap_or(40);
+    let width = (max_chars as f32 * 7.4 + 110.0).max(ui.available_width());
+    egui::ScrollArea::both().auto_shrink([false, false]).id_salt(salt).show_rows(ui, line_h, lines.len(), |ui, range| {
+        ui.set_min_width(width);
+        for i in range {
+            let l = &lines[i];
+            let (rect, _) = ui.allocate_exact_size(vec2(width, line_h), Sense::hover());
+            if l.kind == LineKind::File {
+                ui.painter().rect_filled(rect, CornerRadius::ZERO, p.side);
+                ui.painter().text(pos2(rect.left() + 14.0, rect.center().y), Align2::LEFT_CENTER, &l.text, FontId::monospace(12.5), p.accent);
+                continue;
+            }
+            let (bg, fg, sign) = match l.kind {
+                LineKind::Add => (p.add_bg, p.add, "+"),
+                LineKind::Del => (p.del_bg, p.del, "−"),
+                LineKind::Hunk => (p.soft, p.muted, ""),
+                LineKind::Ctx | LineKind::File => (Color32::TRANSPARENT, p.text, ""),
+            };
+            ui.painter().rect_filled(rect, CornerRadius::ZERO, bg);
+            let no = l.new_no.or(l.old_no).map(|n| n.to_string()).unwrap_or_default();
+            ui.painter().text(pos2(rect.left() + 44.0, rect.center().y), Align2::RIGHT_CENTER, no, font.clone(), p.muted);
+            ui.painter().text(pos2(rect.left() + 56.0, rect.center().y), Align2::LEFT_CENTER, sign, font.clone(), fg);
+            let text = l.text.replace('\t', "    ");
+            ui.painter().text(pos2(rect.left() + 72.0, rect.center().y), Align2::LEFT_CENTER, text, font.clone(), fg);
+        }
+    });
 }

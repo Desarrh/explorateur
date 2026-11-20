@@ -352,3 +352,169 @@ fn glisser_objet_de_donnees_du_shell() {
     assert!(unsafe { obj.QueryGetData(&fmt) }.is_ok());
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// git dans un dossier de test (identité locale à la commande, rien dans la config de l'utilisateur).
+fn git_t(dir: &std::path::Path, args: &[&str]) -> String {
+    let o = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .expect("git");
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+#[test]
+fn rafale_instantanes_diff_restauration() {
+    use crate::git::{burst_restore, snapshot};
+    let d = tmpdir("rafale");
+    git_t(&d, &["init", "-q"]);
+    std::fs::write(d.join("a.txt"), "v1\n").unwrap();
+    std::fs::write(d.join("c.txt"), "garde\n").unwrap();
+    git_t(&d, &["add", "-A"]);
+    git_t(&d, &["commit", "-q", "-m", "init"]);
+    // Changement non commité AVANT la passe : il doit survivre à l'annulation de la passe.
+    std::fs::write(d.join("a.txt"), "v2\n").unwrap();
+    let (base, _) = snapshot(&d, None, &[]).expect("instantané de base");
+    let index_avant = git_t(&d, &["diff", "--cached", "--stat"]);
+
+    // La passe : a modifié, b créé, c supprimé.
+    std::fs::write(d.join("a.txt"), "v3\n").unwrap();
+    std::fs::write(d.join("b.txt"), "nouveau\n").unwrap();
+    std::fs::remove_file(d.join("c.txt")).unwrap();
+    let files: Vec<String> = ["a.txt", "b.txt", "c.txt"].iter().map(|s| s.to_string()).collect();
+    let (after, skipped) = snapshot(&d, Some(&base), &files).expect("instantané de fin");
+    assert!(skipped.is_empty());
+    let diff = git_t(&d, &["diff", &base, &after]);
+    assert!(diff.contains("-v2") && diff.contains("+v3"), "{diff}");
+    assert!(diff.contains("+nouveau") && diff.contains("-garde"), "{diff}");
+    let lines = crate::git::parse_diff(&diff);
+    assert_eq!(lines.iter().filter(|l| l.kind == crate::git::LineKind::File).count(), 3);
+
+    // Annuler la passe : retour à l'état d'avant la passe (v2, pas le commit v1).
+    let (undo, post) = burst_restore(&d, &base, &after, &files).expect("restauration");
+    assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap().trim(), "v2");
+    assert!(!d.join("b.txt").exists());
+    assert_eq!(std::fs::read_to_string(d.join("c.txt")).unwrap().trim(), "garde");
+    // Rétablir.
+    burst_restore(&d, &undo, &post, &files).expect("rétablir");
+    assert_eq!(std::fs::read_to_string(d.join("a.txt")).unwrap().trim(), "v3");
+    assert_eq!(std::fs::read_to_string(d.join("b.txt")).unwrap().trim(), "nouveau");
+    assert!(!d.join("c.txt").exists());
+    // L'index et l'historique du dépôt n'ont pas bougé.
+    assert_eq!(git_t(&d, &["diff", "--cached", "--stat"]), index_avant);
+    assert_eq!(git_t(&d, &["rev-list", "--count", "HEAD"]).trim(), "1");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn rafale_regroupement() {
+    use crate::app::Act;
+    let mut b = crate::bursts::Bursts::default();
+    let root = std::path::Path::new("C:/depot");
+    assert!(b.watch_repo(root).is_some());
+    assert!(b.watch_repo(root).is_none(), "base demandée une seule fois");
+    b.record(root, "a.rs".into(), Act::Modified);
+    b.record(root, "tmp.rs".into(), Act::Created);
+    b.record(root, "tmp.rs".into(), Act::Removed); // créé puis supprimé : rien de net
+    b.record(root, "n.rs".into(), Act::Created);
+    b.record(root, "n.rs".into(), Act::Modified); // reste « créé »
+    assert_eq!(b.list.len(), 1, "une seule passe tant qu'il n'y a pas 20 s de silence");
+    let p = &b.list[0];
+    assert_eq!(p.files.len(), 2);
+    assert!(matches!(p.files["n.rs"], Act::Created));
+    assert!(b.tick().is_empty(), "pas encore close");
+    b.mute(root, &["a.rs".to_string()]);
+    b.record(root, "a.rs".into(), Act::Removed);
+    assert!(matches!(b.list[0].files["a.rs"], Act::Modified), "événements d'une restauration ignorés");
+}
+
+/// Rendu sans fenêtre d'une image de l'app en PNG (règle n° 0 : rien à l'écran).
+/// `prepare` règle l'app ; `ready` dit quand l'image est prête.
+#[cfg(test)]
+pub fn capture_png(
+    out: &Path,
+    s: crate::app::Settings,
+    w: usize,
+    h: usize,
+    mut prepare: impl FnMut(&mut crate::app::App, u32),
+    ready: impl Fn(&crate::app::App) -> bool,
+) {
+    use egui_software_backend::{BufferMutRef, ColorFieldOrder, EguiSoftwareRender};
+    // Mode test : nom d'app à part (journal de plantage, cache), jamais l'état de l'utilisateur.
+    unsafe { std::env::set_var("SOCLE_TEST", "1") };
+    let mut buf = vec![[0u8; 4]; w * h];
+    let mut renderer = EguiSoftwareRender::new(ColorFieldOrder::Rgba);
+    let ctx = egui::Context::default();
+    let mut app = crate::app::App::new(&ctx, s);
+    let t0 = std::time::Instant::now();
+    let mut n = 0u32;
+    loop {
+        prepare(&mut app, n);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32))),
+            ..Default::default()
+        };
+        let o = ctx.run_ui(raw, |ui| {
+            app.tick();
+            app.draw(ui);
+            app.apply_actions();
+        });
+        let prims = ctx.tessellate(o.shapes, o.pixels_per_point);
+        buf.iter_mut().for_each(|px| *px = [app.pal.bg.r(), app.pal.bg.g(), app.pal.bg.b(), 255]);
+        renderer.render(&mut BufferMutRef::new(&mut buf, w, h), &prims, &o.textures_delta, o.pixels_per_point);
+        n += 1;
+        if (ready(&app) && n > 3) || t0.elapsed().as_secs() > 20 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    let raw: Vec<u8> = buf.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+    image::RgbaImage::from_raw(w as u32, h as u32, raw).unwrap().save(out).unwrap();
+}
+
+/// Capture de la vue Dev avec des passes d'agent (E1).
+/// `CAPTURE_DIR=<dossier> cargo test --release capture_passes -- --ignored`
+#[test]
+#[ignore]
+fn capture_passes() {
+    use crate::app::Act;
+    let outdir = PathBuf::from(std::env::var("CAPTURE_DIR").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned()));
+    let d = tmpdir("capture-passes");
+    git_t(&d, &["init", "-q"]);
+    std::fs::create_dir_all(d.join("src")).unwrap();
+    std::fs::write(d.join("src").join("main.rs"), "fn main() {\n    println!(\"bonjour\");\n}\n").unwrap();
+    std::fs::write(d.join("README.md"), "# Démo\n").unwrap();
+    git_t(&d, &["add", "-A"]);
+    git_t(&d, &["commit", "-q", "-m", "init"]);
+    let root = PathBuf::from(git_t(&d, &["rev-parse", "--show-toplevel"]).trim().replace('/', "\\"));
+    for dark in [false, true] {
+        let s = crate::app::Settings { tabs: vec![d.clone()], dev: true, dark, global_index: false, auto_update: false, folder_sizes: false, ..Default::default() };
+        let r2 = root.clone();
+        let d2 = d.clone();
+        let mut stage = 0;
+        capture_png(
+            &outdir.join(format!("passes-{}.png", if dark { "sombre" } else { "clair" })),
+            s,
+            1400,
+            860,
+            move |app, _| {
+                // 1. attendre le dépôt et son instantané de base ; 2. simuler une passe ; 3. l'afficher.
+                if stage == 0 && app.repo.is_some() && app.bursts.snapshot_of(&r2).is_some() {
+                    std::fs::write(d2.join("src").join("main.rs"), "fn main() {\n    println!(\"bonjour, monde\");\n    let x = 42;\n}\n").unwrap();
+                    std::fs::write(d2.join("src").join("lib.rs"), "pub fn aide() {}\n").unwrap();
+                    app.bursts.record(&r2, "src/main.rs".into(), Act::Modified);
+                    app.bursts.record(&r2, "src/lib.rs".into(), Act::Created);
+                    app.bursts.record(&r2, "README.md".into(), Act::Modified);
+                    let id = app.bursts.list[0].id;
+                    app.burst_expanded.insert(id);
+                    app.actions.push(crate::app::Action::BurstView(id));
+                    stage = 1;
+                }
+            },
+            |app| app.burst_diff.as_ref().map(|d| !d.1.is_empty()).unwrap_or(false),
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
