@@ -277,6 +277,8 @@ impl App {
                 ui.checkbox(&mut self.s.use_viewer, "Ouvrir les médias dans le lecteur universel")
                     .on_hover_text("Images, PDF, Word, audio, vidéo et code s’ouvrent dans le lecteur (double-clic, Entrée)")
                     .on_disabled_hover_text("Lecteur introuvable : compile C:\\Dev\\lecteur-universel");
+                ui.checkbox(&mut self.s.quick_viewer, "Espace : aperçu rapide dans le lecteur")
+                    .on_hover_text("Sinon, Espace ouvre l’aperçu plein écran intégré. Si le lecteur ne répond pas, l’aperçu intégré prend le relais.");
             });
             if ui
                 .checkbox(&mut self.s.global_index, "Recherche dans tous les disques (Ctrl+P)")

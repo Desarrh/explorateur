@@ -191,6 +191,23 @@ fn bench_index() {
     println!("  mémoire de l'index ≈ {} Mo", d.mem_bytes() / 1_000_000);
 }
 
+/// Tube inexistant : le test ne doit jamais parler au vrai lecteur s'il est en veille.
+const FAUX_TUBE: &str = r"\\.\pipe\explorateur-test-inexistant";
+
+#[test]
+fn apercu_rapide_repli_silencieux() {
+    let ctx = egui::Context::default();
+    let f = PathBuf::from(r"C:\Windows\win.ini");
+    // 1. lecteur introuvable → repli immédiat
+    let (tx, rx) = crossbeam_channel::unbounded();
+    crate::viewer::quick_look_via(FAUX_TUBE, Path::new(r"C:\nexiste\pas\lecteur.exe"), &f, tx, ctx.clone());
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(2)).ok(), Some(f.clone()));
+    // 2. « lecteur » qui sort en erreur tout de suite (where.exe refuse --apercu) → repli
+    let (tx, rx) = crossbeam_channel::unbounded();
+    crate::viewer::quick_look_via(FAUX_TUBE, Path::new(r"C:\Windows\System32\where.exe"), &f, tx, ctx);
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(3)).ok(), Some(f));
+}
+
 #[test]
 fn comparaison_de_versions() {
     use crate::updater::is_newer;

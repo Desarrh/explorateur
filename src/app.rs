@@ -44,6 +44,8 @@ pub struct Settings {
     pub folder_sizes: bool,
     /// Ouvrir images, PDF, Word, audio, vidéo, code dans le lecteur universel (double-clic, Entrée).
     pub use_viewer: bool,
+    /// Espace = aperçu rapide dans le lecteur universel (sinon aperçu plein écran intégré).
+    pub quick_viewer: bool,
     /// Index global de tous les fichiers (recherche instantanée dans Ctrl+P).
     pub global_index: bool,
     /// Vérifier les mises à jour sur GitHub (au plus une fois par jour).
@@ -70,6 +72,7 @@ impl Default for Settings {
             visits: HashMap::new(),
             folder_sizes: true,
             use_viewer: true,
+            quick_viewer: true,
             global_index: true,
             auto_update: true,
             last_update_check: 0,
@@ -413,6 +416,9 @@ pub struct App {
     pub batch: Option<BatchRename>,
     /// Exe du lecteur universel, s'il est installé.
     pub viewer: Option<PathBuf>,
+    /// Repli de l'aperçu rapide : le lecteur n'a pas pu s'ouvrir → aperçu intégré pour ce fichier.
+    preview_fallback_tx: Sender<PathBuf>,
+    preview_fallback_rx: Receiver<PathBuf>,
     pub index: Option<crate::index::Index>,
     /// Mise à jour disponible (bandeau dans la barre d'état).
     pub update: Option<crate::updater::Release>,
@@ -511,6 +517,7 @@ impl App {
         });
 
         let (utx, urx) = unbounded();
+        let (pftx, pfrx) = unbounded();
         let mut app = App {
             drag_out: None,
             native_menu: None,
@@ -523,6 +530,8 @@ impl App {
             fullview: None,
             batch: None,
             viewer: crate::viewer::find(),
+            preview_fallback_tx: pftx,
+            preview_fallback_rx: pfrx,
             index: None,
             update: None,
             update_busy: None,
@@ -1185,6 +1194,10 @@ impl App {
     /// Appelé à chaque image, avant le dessin.
     pub fn tick(&mut self) {
         self.process_updates();
+        // Le lecteur n'a pas répondu à un aperçu rapide : aperçu intégré, sans message d'erreur.
+        while let Ok(p) = self.preview_fallback_rx.try_recv() {
+            self.fullview = Some(p);
+        }
         while let Ok(req) = self.inbox_rx.try_recv() {
             let p = PathBuf::from(req.trim());
             let p = if p.is_dir() { p } else { dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\")) };
@@ -1906,7 +1919,15 @@ impl App {
             Action::OpenGoto => {
                 self.goto = Some(Goto { query: String::new(), sel: 0, fresh: true, hits: vec![], hits_q: String::new() })
             }
-            Action::FullView(p) => self.fullview = Some(p),
+            Action::FullView(p) => {
+                let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+                match self.viewer.clone() {
+                    Some(v) if self.s.quick_viewer && p.is_file() && crate::viewer::handles(&ext) => {
+                        crate::viewer::quick_look(&v, &p, self.preview_fallback_tx.clone(), self.ctx.clone());
+                    }
+                    _ => self.fullview = Some(p),
+                }
+            }
             Action::OpenBatchRename => {
                 let paths = self.tab().selection();
                 if !paths.is_empty() {
