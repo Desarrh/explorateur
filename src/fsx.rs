@@ -55,8 +55,10 @@ impl Entry {
     }
 }
 
+/// Formats que le socle décode lui-même (liste calculée une fois).
 pub fn is_image_ext(ext: &str) -> bool {
-    matches!(ext, "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico")
+    static SET: std::sync::OnceLock<std::collections::HashSet<&'static str>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| socle::images::extensions().into_iter().collect()).contains(ext)
 }
 
 pub fn is_video_ext(ext: &str) -> bool {
@@ -206,22 +208,6 @@ pub fn kind_label(e: &Entry) -> String {
     }
 }
 
-pub fn icon_for(e: &Entry) -> &'static str {
-    if e.is_dir {
-        return "📁";
-    }
-    match e.ext.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "svg" => "🖼",
-        "mp3" | "wav" | "ogg" | "flac" => "🎵",
-        "mp4" | "mkv" | "avi" | "mov" | "webm" => "🎞",
-        "zip" | "7z" | "rar" | "tar" | "gz" => "📦",
-        "exe" | "msi" | "bat" | "cmd" | "ps1" => "⚙",
-        "pdf" => "📕",
-        _ if is_text_ext(&e.ext) => "📝",
-        _ => "📄",
-    }
-}
-
 /// Nom libre dans `dir` : « nom », « nom (2) », « nom (3) »…
 pub fn unique_name(dir: &Path, name: &str) -> PathBuf {
     let cand = dir.join(name);
@@ -238,33 +224,6 @@ pub fn unique_name(dir: &Path, name: &str) -> PathBuf {
         }
     }
     unreachable!()
-}
-
-/// Score flou (sous-séquence). `None` si pas de correspondance.
-pub fn fuzzy_score(hay_lower: &str, needle_lower: &str) -> Option<i32> {
-    if needle_lower.is_empty() {
-        return Some(0);
-    }
-    if let Some(pos) = hay_lower.find(needle_lower) {
-        return Some(1000 - pos as i32 * 2 - hay_lower.len() as i32);
-    }
-    let mut score = 0;
-    let mut it = hay_lower.chars().enumerate();
-    let mut last = None::<usize>;
-    for nc in needle_lower.chars() {
-        loop {
-            let (i, hc) = it.next()?;
-            if hc == nc {
-                score += match last {
-                    Some(l) if l + 1 == i => 8,
-                    _ => 1,
-                };
-                last = Some(i);
-                break;
-            }
-        }
-    }
-    Some(score - hay_lower.len() as i32 / 4)
 }
 
 pub fn read_text_preview(path: &Path, max: usize) -> Option<String> {

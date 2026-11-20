@@ -1,5 +1,6 @@
 //! Miniatures décodées en tâche de fond : l'interface ne bloque jamais.
-//! Images courantes : décodeur Rust. Le reste (vidéos, PDF, Office, PSD, HEIC, pochettes MP3…) :
+//! Images (PNG, JPEG, WebP, AVIF, TIFF, SVG, PSD, HEIC via WIC…) : décodeurs du socle, avec
+//! cache disque QOI (%LOCALAPPDATA%\Explorateur\miniatures). Le reste (vidéos, PDF, Office, PSD, HEIC, pochettes MP3…) :
 //! le fournisseur de miniatures de Windows, exactement comme l'Explorateur.
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use egui::{ColorImage, TextureHandle, TextureOptions};
@@ -27,18 +28,25 @@ impl Thumbs {
     pub fn new(ctx: &egui::Context) -> Self {
         let (tx, req_rx) = unbounded::<Key>();
         let (res_tx, rx) = unbounded();
+        let disk = socle::images::DiskCache::for_app(crate::app::APP);
+        // Ménage du cache disque (500 Mo max), sans retarder le démarrage.
+        let d2 = disk.clone();
+        std::thread::spawn(move || {
+            let _ = d2.prune(500 * 1024 * 1024);
+        });
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 4);
         for _ in 0..workers {
             let req_rx = req_rx.clone();
             let res_tx = res_tx.clone();
             let ctx = ctx.clone();
+            let disk = disk.clone();
             std::thread::spawn(move || {
                 #[cfg(windows)]
                 unsafe {
                     let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
                 }
                 while let Ok(key) = req_rx.recv() {
-                    let img = decode(&key.0, key.1);
+                    let img = decode(&key.0, key.1, &disk);
                     if res_tx.send((key, img)).is_err() {
                         break;
                     }
@@ -91,11 +99,10 @@ impl Thumbs {
     }
 }
 
-fn decode(path: &Path, size: u32) -> Option<ColorImage> {
-    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    if crate::fsx::is_image_ext(&ext) {
-        if let Some(img) = decode_rust(path, size) {
-            return Some(img);
+pub(crate) fn decode(path: &Path, size: u32, disk: &socle::images::DiskCache) -> Option<ColorImage> {
+    if socle::images::is_supported(path) {
+        if let Ok(img) = socle::images::thumbnail_cached(disk, path, size, &socle::Cancel::new()) {
+            return Some(socle::images::to_color_image(&img));
         }
     }
     #[cfg(windows)]
@@ -106,23 +113,11 @@ fn decode(path: &Path, size: u32) -> Option<ColorImage> {
     None
 }
 
-fn decode_rust(path: &Path, size: u32) -> Option<ColorImage> {
-    let meta = std::fs::metadata(path).ok()?;
-    if meta.len() > 120 * 1024 * 1024 {
-        return None;
-    }
-    let img = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok()?;
-    let img = if img.width() > size || img.height() > size { img.thumbnail(size, size) } else { img };
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    Some(ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw()))
-}
-
 /// Miniature fournie par Windows (IShellItemImageFactory). Pas d'icône générique :
 /// seulement une vraie miniature, sinon `None`.
 #[cfg(windows)]
 fn shell_thumb(path: &Path, size: u32) -> Option<ColorImage> {
-    use windows::Win32::Foundation::{HWND, SIZE};
+    use windows::Win32::Foundation::SIZE;
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC,
     };
@@ -136,10 +131,10 @@ fn shell_thumb(path: &Path, size: u32) -> Option<ColorImage> {
             .GetImage(SIZE { cx: size as i32, cy: size as i32 }, SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK)
             .ok()?;
         let mut bm = BITMAP::default();
-        GetObjectW(hbmp, std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut BITMAP as *mut _));
+        GetObjectW(hbmp.into(), std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut BITMAP as *mut _));
         let (w, h) = (bm.bmWidth, bm.bmHeight.abs());
         if w <= 0 || h <= 0 || w > 4096 || h > 4096 {
-            let _ = DeleteObject(hbmp);
+            let _ = DeleteObject(hbmp.into());
             return None;
         }
         let mut bi = BITMAPINFO::default();
@@ -153,10 +148,10 @@ fn shell_thumb(path: &Path, size: u32) -> Option<ColorImage> {
             ..Default::default()
         };
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        let hdc = GetDC(HWND::default());
+        let hdc = GetDC(None);
         let lines = GetDIBits(hdc, hbmp, 0, h as u32, Some(buf.as_mut_ptr() as *mut _), &mut bi, DIB_RGB_COLORS);
-        ReleaseDC(HWND::default(), hdc);
-        let _ = DeleteObject(hbmp);
+        ReleaseDC(None, hdc);
+        let _ = DeleteObject(hbmp.into());
         if lines == 0 {
             return None;
         }

@@ -218,64 +218,6 @@ pub mod default_explorer {
     }
 }
 
-// ---------- Une seule fenêtre ----------
-//
-// Si l'app tourne déjà, une nouvelle instance dépose le dossier demandé dans une « boîte aux
-// lettres » (%APPDATA%\Explorateur\inbox) et se ferme ; la fenêtre ouverte l'ouvre dans un onglet.
-pub mod single {
-    use std::path::PathBuf;
-
-    pub fn inbox() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("Explorateur").join("inbox"))
-    }
-
-    /// `true` si une autre instance tourne déjà (mutex nommé, gardé jusqu'à la fin du processus).
-    #[cfg(windows)]
-    pub fn another_running() -> bool {
-        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
-        use windows_sys::Win32::System::Threading::CreateMutexW;
-        let name = super::wide("Local\\Explorateur.SingleInstance");
-        unsafe {
-            let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-            !h.is_null() && GetLastError() == ERROR_ALREADY_EXISTS
-        }
-    }
-
-    /// Transmet le dossier à l'instance déjà ouverte et l'autorise à passer au premier plan.
-    pub fn forward(path: Option<PathBuf>) -> bool {
-        let Some(dir) = inbox() else { return false };
-        let _ = std::fs::create_dir_all(&dir);
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        let tmp = dir.join(format!("{stamp}.tmp"));
-        let body = path.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-        if std::fs::write(&tmp, body).is_err() || std::fs::rename(&tmp, dir.join(format!("{stamp}.req"))).is_err() {
-            return false;
-        }
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(u32::MAX); // ASFW_ANY
-        }
-        true
-    }
-
-    /// Lit et vide les demandes en attente. Chaîne vide = « nouvel onglet sur le dossier perso ».
-    pub fn take_requests() -> Vec<String> {
-        let Some(dir) = inbox() else { return vec![] };
-        let Ok(rd) = std::fs::read_dir(&dir) else { return vec![] };
-        let mut files: Vec<PathBuf> =
-            rd.flatten().map(|e| e.path()).filter(|p| p.extension().map(|e| e == "req").unwrap_or(false)).collect();
-        files.sort();
-        files
-            .into_iter()
-            .filter_map(|f| {
-                let s = std::fs::read_to_string(&f).ok();
-                let _ = std::fs::remove_file(&f);
-                s
-            })
-            .collect()
-    }
-}
-
 /// Le vrai menu clic droit de Windows (7-Zip, Git, « Envoyer vers », extensions…).
 /// Bloquant tant que le menu est ouvert, comme dans l'Explorateur.
 #[cfg(windows)]
@@ -308,7 +250,7 @@ pub fn native_context_menu(hwnd: isize, paths: &[std::path::PathBuf]) -> Result<
             let arr = SHCreateShellItemArrayFromIDLists(&consts)?;
             let cm: IContextMenu = arr.BindToHandler(None, &BHID_SFUIObject)?;
             let menu = CreatePopupMenu()?;
-            cm.QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL)?;
+            cm.QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL).ok()?;
             let mut pt = POINT::default();
             GetCursorPos(&mut pt)?;
             let hwnd = HWND(hwnd as *mut _);

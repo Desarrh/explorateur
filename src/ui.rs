@@ -6,41 +6,22 @@ use egui::{
     pos2, vec2, Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Rect, RichText, Sense, Stroke,
     StrokeKind, Ui,
 };
+use socle::icons::{self, Icon, Look};
+use socle::ui::Command;
+use socle::theme::blend;
+use socle::ui::{ago, paint_text_left, paint_text_right};
 use std::path::PathBuf;
 
-const ROW_H: f32 = 28.0;
+const ROW_H: f32 = socle::theme::dim::LIGNE;
 
-fn trunc(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> std::sync::Arc<egui::Galley> {
-    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
-    job.wrap = egui::text::TextWrapping::truncate_at_width(max_w.max(8.0));
-    ui.painter().layout_job(job)
+/// Icône vectorielle d'une entrée (dossier, ou d'après l'extension).
+pub fn entry_icon(e: &Entry) -> Icon {
+    if e.is_dir { Icon::Folder } else { Icon::for_extension(&e.ext) }
 }
 
-fn paint_text_left(ui: &Ui, rect: Rect, x: f32, text: &str, font: FontId, color: Color32, max_w: f32) {
-    let g = trunc(ui, text, font, color, max_w);
-    let y = rect.center().y - g.size().y / 2.0;
-    ui.painter().galley(pos2(x, y), g, color);
-}
-
-fn paint_text_right(ui: &Ui, rect: Rect, right: f32, text: &str, font: FontId, color: Color32) {
-    ui.painter().text(pos2(right, rect.center().y), Align2::RIGHT_CENTER, text, font, color);
-}
-
-fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
-    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
-}
-
-fn ago(secs: f32) -> String {
-    let s = secs as u64;
-    if s < 60 {
-        format!("{s} s")
-    } else if s < 3600 {
-        format!("{} min", s / 60)
-    } else {
-        format!("{} h", s / 3600)
-    }
+/// Peint une icône carrée de côté `size` centrée en `c`.
+pub fn paint_icon(ui: &Ui, c: egui::Pos2, size: f32, icon: Icon, color: Color32) {
+    icons::paint(ui.painter(), Rect::from_center_size(c, vec2(size, size)), icon, color);
 }
 
 impl App {
@@ -70,7 +51,7 @@ impl App {
         }
         self.draw_drag_ghost(ui);
         self.draw_confirm(ui);
-        self.draw_help(ui);
+        self.draw_palette_and_help(ui);
         self.draw_batch(ui);
         self.draw_goto(ui);
         self.draw_fullview(ui);
@@ -146,7 +127,7 @@ impl App {
                         let hovered = r.hovered();
                         let fill = if active { p.surface } else if hovered { p.hover_bg } else { p.chrome };
                         ui.painter().rect_filled(rect, CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 }, fill);
-                        ui.painter().text(pos2(rect.left() + 14.0, rect.center().y), Align2::LEFT_CENTER, "📁", FontId::proportional(15.0), p.accent);
+                        paint_icon(ui, pos2(rect.left() + 22.0, rect.center().y), 17.0, Icon::Folder, p.accent);
                         let mut text_max = rect.width() - 80.0;
                         if t.has_live() {
                             ui.painter().circle_filled(pos2(rect.right() - 44.0, rect.center().y), 4.0, p.live);
@@ -161,7 +142,7 @@ impl App {
                                 ui.painter().rect_filled(xr, CornerRadius::same(6), p.soft);
                             }
                             let xc = if xresp.hovered() || active || hovered { p.text } else { p.muted };
-                            ui.painter().text(xr.center(), Align2::CENTER_CENTER, "×", FontId::proportional(18.0), xc);
+                            paint_icon(ui, xr.center(), 14.0, Icon::Close, xc);
                             if xresp.on_hover_text("Fermer (Ctrl+W)").clicked() {
                                 self.actions.push(Action::CloseTab(i));
                             }
@@ -178,11 +159,7 @@ impl App {
                         }
                         r.on_hover_text(t.path.display().to_string());
                     }
-                    if ui
-                        .add(egui::Button::new(RichText::new("+").size(20.0).color(p.muted)).frame(false).min_size(vec2(40.0, 40.0)))
-                        .on_hover_text("Nouvel onglet (Ctrl+T)")
-                        .clicked()
-                    {
+                    if icons::button(ui, Icon::Plus, 40.0, Look { fg: p.muted, ..Look::tool(&p) }, "Nouvel onglet (Ctrl+T)").clicked() {
                         self.actions.push(Action::NewTab(PathBuf::new()));
                     }
                 });
@@ -197,56 +174,46 @@ impl App {
             .frame(Frame::new().fill(p.surface).inner_margin(Margin::symmetric(12, 8)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let nav = |ui: &mut Ui, icon: &str, tip: &str, enabled: bool| {
-                        ui.add_enabled(enabled, egui::Button::new(RichText::new(icon).size(15.0)).min_size(vec2(32.0, 32.0)))
-                            .on_hover_text(tip)
-                            .clicked()
+                    let nav = |ui: &mut Ui, icon: Icon, tip: &str, enabled: bool| {
+                        ui.add_enabled_ui(enabled, |ui| icons::button(ui, icon, 32.0, Look::tool(&p), tip).clicked()).inner
                     };
                     let (can_back, can_fwd, can_up) =
                         (!self.tab().back.is_empty(), !self.tab().fwd.is_empty(), self.tab().path.parent().is_some());
-                    if nav(ui, "←", "Précédent (Alt+←)", can_back) {
+                    if nav(ui, Icon::ArrowLeft, "Précédent (Alt+←)", can_back) {
                         self.actions.push(Action::Back);
                     }
-                    if nav(ui, "→", "Suivant (Alt+→)", can_fwd) {
+                    if nav(ui, Icon::ArrowRight, "Suivant (Alt+→)", can_fwd) {
                         self.actions.push(Action::Forward);
                     }
-                    if nav(ui, "↑", "Dossier parent (Retour arrière)", can_up) {
+                    if nav(ui, Icon::ArrowUp, "Dossier parent (Retour arrière)", can_up) {
                         self.actions.push(Action::Up);
                     }
-                    if nav(ui, "⟳", "Actualiser (F5)", true) {
+                    if nav(ui, Icon::Refresh, "Actualiser (F5)", true) {
                         self.actions.push(Action::Refresh);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         // De droite à gauche
-                        let theme_icon = if self.s.dark { "☀" } else { "🌙" };
+                        let theme_icon = if self.s.dark { Icon::Sun } else { Icon::Moon };
                         let tip = if self.s.dark { "Thème clair" } else { "Thème sombre" };
-                        if ui.add(egui::Button::new(theme_icon).min_size(vec2(32.0, 32.0))).on_hover_text(tip).clicked() {
+                        if icons::button(ui, theme_icon, 32.0, Look::tool(&p), tip).clicked() {
                             let d = !self.s.dark;
                             self.set_dark(d);
                         }
                         self.draw_more_menu(ui);
-                        Frame::new().fill(p.soft).corner_radius(CornerRadius::same(9)).inner_margin(Margin::same(3)).show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.x = 2.0;
-                            let seg = |ui: &mut Ui, on: bool, text: &str| {
-                                let fill = if on { if p.dark { Color32::from_rgb(0x2B, 0x44, 0x70) } else { p.surface } } else { Color32::TRANSPARENT };
-                                let color = if on { p.text } else { p.muted };
-                                ui.add(egui::Button::new(RichText::new(text).color(color).strong()).fill(fill).min_size(vec2(0.0, 28.0)))
-                            };
-                            // ordre inversé (droite → gauche)
-                            if seg(ui, self.s.dev, "</>  Dev").on_hover_text("Vue dev : changements live, diff, commit (Ctrl+Maj+D)").clicked() {
-                                self.s.dev = true;
-                            }
-                            if seg(ui, !self.s.dev, "▦  Bureau").on_hover_text("Vue bureautique").clicked() {
-                                self.s.dev = false;
-                            }
-                        });
+                        // Contrôle segmenté du socle. La barre est en droite → gauche : les segments
+                        // sont donnés à l'envers pour s'afficher « Bureau | Dev ».
+                        let mut seg = if self.s.dev { 0 } else { 1 };
+                        if socle::ui::segmented(ui, &p, &mut seg, &[(Some(Icon::Code), "Dev"), (Some(Icon::Grid), "Bureau")]) {
+                            self.s.dev = seg == 0;
+                        }
                         if !self.s.dev {
                             ui.add_space(4.0);
                             let grid = self.s.grid;
-                            if ui.add(egui::Button::new("▦").selected(grid).min_size(vec2(32.0, 32.0))).on_hover_text("Grille / miniatures (Ctrl+Maj+G)").clicked() {
+                            let look = |on: bool| if on { Look::active(&p) } else { Look::tool(&p) };
+                            if icons::button(ui, Icon::Grid, 32.0, look(grid), "Grille / miniatures (Ctrl+2)").clicked() {
                                 self.s.grid = true;
                             }
-                            if ui.add(egui::Button::new("☰").selected(!grid).min_size(vec2(32.0, 32.0))).on_hover_text("Liste détaillée (Ctrl+Maj+L)").clicked() {
+                            if icons::button(ui, Icon::ListView, 32.0, look(!grid), "Liste détaillée (Ctrl+1)").clicked() {
                                 self.s.grid = false;
                             }
                         }
@@ -263,7 +230,9 @@ impl App {
 
     fn draw_more_menu(&mut self, ui: &mut Ui) {
         let cur = self.tab().path.clone();
-        ui.menu_button(RichText::new("⋯").size(16.0), |ui| {
+        let p = self.pal;
+        let more = icons::button(ui, Icon::More, 32.0, Look::tool(&p), "Plus d’options");
+        egui::Popup::menu(&more).show(|ui| {
             ui.set_min_width(240.0);
             let mut hidden = self.s.show_hidden;
             if ui.checkbox(&mut hidden, "Afficher les fichiers cachés (Ctrl+H)").changed() {
@@ -359,44 +328,30 @@ impl App {
     fn draw_search(&mut self, ui: &mut Ui) {
         let p = self.pal;
         let ai = self.active;
-        let t = &mut self.tabs[ai];
-        let rec_tip = "Chercher aussi dans les sous-dossiers";
-        let rec = ui
-            .add(egui::Button::new(RichText::new("⤵").size(14.0)).selected(t.recursive).min_size(vec2(30.0, 32.0)))
-            .on_hover_text(rec_tip);
-        if rec.clicked() {
-            t.recursive = !t.recursive;
+        let recursive = self.tabs[ai].recursive;
+        let look = if recursive { Look::active(&p) } else { Look::tool(&p) };
+        if icons::button(ui, Icon::SearchDeep, 32.0, look, "Chercher aussi dans les sous-dossiers").clicked() {
+            self.tabs[ai].recursive = !recursive;
             self.actions.push(Action::StartSearch);
         }
-        let hint = if t.recursive { "Rechercher partout dessous…" } else { "Filtrer (Ctrl+F)" };
-        let edit = Frame::new()
-            .fill(p.code)
-            .stroke(Stroke::new(1.0, p.border))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(8, 6))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("🔍").color(p.muted));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut t.filter)
-                            .id(egui::Id::new("search"))
-                            .hint_text(hint)
-                            .frame(Frame::NONE)
-                            .desired_width(190.0),
-                    )
-                })
-                .inner
-            })
-            .inner;
-        if edit.changed() {
+        // Autocomplétion (T4) : noms du dossier + recherches passées, Tab complète.
+        let hint = if recursive { "Rechercher partout dessous…" } else { "Filtrer (Ctrl+F)" };
+        let mut text = std::mem::take(&mut self.tabs[ai].filter);
+        let before = text.clone();
+        let r = socle::ui::autocomplete_field(ui, &p, egui::Id::new("search"), &mut self.filter_field, &self.filter_ac, &mut text, hint, 220.0);
+        let t = &mut self.tabs[ai];
+        t.filter = text;
+        if t.filter != before {
             t.view_dirty = true;
             if t.recursive {
                 self.actions.push(Action::StartSearch);
             }
         }
-        if edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        if let Some(q) = r.submitted {
+            self.filter_ac.history.record(&q);
+            self.s.filter_history = self.filter_ac.history.clone();
             // Entrée : ouvrir le premier résultat
-            if let Some(e) = t.entry(0) {
+            if let Some(e) = self.tabs[ai].entry(0) {
                 self.actions.push(Action::Open(e.path.clone()));
             }
         }
@@ -412,30 +367,32 @@ impl App {
             .stroke(Stroke::new(1.0, p.border))
             .corner_radius(CornerRadius::same(8))
             .inner_margin(Margin::symmetric(10, 6));
-        if let Some(text) = t.address.as_mut() {
-            let mut go = None;
-            let mut cancel = false;
-            frame.show(ui, |ui| {
-                ui.set_width(w - 22.0);
-                let r = ui.add(egui::TextEdit::singleline(text).frame(Frame::NONE).desired_width(f32::INFINITY).id(egui::Id::new("address")));
-                if !r.has_focus() && !r.lost_focus() {
-                    r.request_focus();
-                }
-                if r.lost_focus() {
-                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        go = Some(text.as_str().to_owned());
-                    } else {
-                        cancel = true;
-                    }
-                }
-            });
+        if t.address.is_some() {
+            // Autocomplétion (T4) : sous-dossiers du chemin tapé (lus sur un thread) + dossiers fréquents.
+            let mut text = t.address.take().unwrap_or_default();
+            self.refresh_address_candidates(&text);
+            let id = egui::Id::new("address");
+            let r = socle::ui::autocomplete_field(ui, &p, id, &mut self.addr_field, &self.addr_ac, &mut text, "Chemin du dossier", w - 4.0);
+            if !r.response.has_focus() && !r.response.lost_focus() && !self.addr_focused {
+                r.response.request_focus();
+                self.addr_focused = true;
+            }
+            let go = r.submitted.clone();
+            let cancel = go.is_none() && r.response.lost_focus() && !r.completed;
+            let t = &mut self.tabs[ai];
+            t.address = Some(text);
             if let Some(g) = go {
+                self.addr_ac.history.record(&g);
+                self.s.addr_history = self.addr_ac.history.clone();
+                self.addr_focused = false;
+                let t = &mut self.tabs[ai];
                 t.address = None;
                 let g = g.trim().trim_matches('"').to_string();
                 let path = if g == "~" { dirs::home_dir().unwrap_or_default() } else { PathBuf::from(g) };
                 self.actions.push(Action::Navigate(path));
             } else if cancel {
-                t.address = None;
+                self.tabs[ai].address = None;
+                self.addr_focused = false;
             }
             return;
         }
@@ -505,7 +462,7 @@ impl App {
                         ui.label(RichText::new(t.to_uppercase()).size(11.0).color(p.muted).strong());
                         ui.add_space(2.0);
                     };
-                    let item = |ui: &mut Ui, icon: &str, name: &str, path: &PathBuf, actions: &mut Vec<Action>, pinned: bool| {
+                    let item = |ui: &mut Ui, icon: Icon, name: &str, path: &PathBuf, actions: &mut Vec<Action>, pinned: bool| {
                         let on = &cur == path;
                         let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
                         let hover_drop = r.dnd_hover_payload::<DragPaths>().is_some();
@@ -519,7 +476,7 @@ impl App {
                             Color32::TRANSPARENT
                         };
                         ui.painter().rect_filled(rect, CornerRadius::same(7), bg);
-                        ui.painter().text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, icon, FontId::proportional(14.0), p.accent);
+                        paint_icon(ui, pos2(rect.left() + 18.0, rect.center().y), 16.0, icon, p.accent);
                         paint_text_left(ui, rect, rect.left() + 34.0, name, FontId::proportional(13.5), p.text, rect.width() - 40.0);
                         if r.clicked() {
                             actions.push(Action::Navigate(path.clone()));
@@ -556,23 +513,23 @@ impl App {
                         if let Some(r) = &self.repo {
                             section(ui, "Dépôt");
                             let name = r.root.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                            item(ui, "⎇", &name, &r.root.clone(), &mut acts, false);
+                            item(ui, Icon::Git, &name, &r.root.clone(), &mut acts, false);
                         }
                     }
                     section(ui, "Accès rapide");
                     for (name, path) in self.quick.clone() {
-                        item(ui, "📁", &name, &path, &mut acts, false);
+                        item(ui, Icon::Folder, &name, &path, &mut acts, false);
                     }
                     if !self.s.pinned.is_empty() {
                         section(ui, "Épinglés");
                         for path in self.s.pinned.clone() {
                             let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-                            item(ui, "📌", &name, &path, &mut acts, true);
+                            item(ui, Icon::Pin, &name, &path, &mut acts, true);
                         }
                     }
                     section(ui, "Disques");
                     for d in &self.drives {
-                        item(ui, "🖴", &d.label, &d.root, &mut acts, false);
+                        item(ui, Icon::Drive, &d.label, &d.root, &mut acts, false);
                         let used = 1.0 - d.free as f32 / d.total.max(1) as f32;
                         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 14.0), Sense::hover());
                         let bar = Rect::from_min_size(pos2(rect.left() + 10.0, rect.top() + 1.0), vec2(rect.width() - 20.0, 4.0));
@@ -744,13 +701,23 @@ impl App {
     fn sort_header(&mut self, ui: &mut Ui, rect: Rect, label: &str, key: Sort, right: bool) {
         let p = self.pal;
         let r = ui.interact(rect, ui.id().with(("hdr", label)), Sense::click());
-        let arrow = if self.s.sort == key { if self.s.asc { " ▲" } else { " ▼" } } else { "" };
-        let txt = format!("{}{arrow}", label.to_uppercase());
+        let txt = label.to_uppercase();
         let color = if r.hovered() { p.text } else { p.muted };
+        let font = FontId::proportional(socle::theme::taille::ENTETE);
+        // Chevron de tri (icône vectorielle) à côté du libellé de la colonne triée
+        let chevron = (self.s.sort == key).then_some(if self.s.asc { Icon::ChevronUp } else { Icon::ChevronDown });
+        let tw = ui.painter().layout_no_wrap(txt.clone(), font.clone(), color).size().x;
         if right {
-            paint_text_right(ui, rect, rect.right() - 4.0, &txt, FontId::proportional(11.0), color);
+            let x = rect.right() - 4.0 - if chevron.is_some() { 14.0 } else { 0.0 };
+            paint_text_right(ui, rect, x, &txt, font, color);
+            if let Some(ic) = chevron {
+                paint_icon(ui, pos2(rect.right() - 10.0, rect.center().y), 11.0, ic, color);
+            }
         } else {
-            paint_text_left(ui, rect, rect.left(), &txt, FontId::proportional(11.0), color, rect.width());
+            paint_text_left(ui, rect, rect.left(), &txt, font, color, rect.width());
+            if let Some(ic) = chevron {
+                paint_icon(ui, pos2(rect.left() + tw + 9.0, rect.center().y), 11.0, ic, color);
+            }
         }
         if r.clicked() {
             self.actions.push(Action::Sort(key));
@@ -835,7 +802,7 @@ impl App {
                 }
                 // icône + nom
                 let icon_color = if e.is_dir { p.accent } else { p.muted };
-                ui.painter().text(pos2(rect.left() + 18.0, rect.center().y), Align2::LEFT_CENTER, fsx::icon_for(e), FontId::proportional(14.0), icon_color);
+                paint_icon(ui, pos2(rect.left() + 26.0, rect.center().y), 16.0, entry_icon(e), icon_color);
                 let name = if searching { e.display.clone().unwrap_or_else(|| e.name.clone()) } else { e.name.clone() };
                 let name_color = if e.hidden { p.muted } else { p.text };
                 if !renaming {
@@ -953,7 +920,7 @@ impl App {
                     }
                     if !drawn {
                         let col = if e.is_dir { p.accent } else { p.muted };
-                        ui.painter().text(thumb.center(), Align2::CENTER_CENTER, fsx::icon_for(&e), FontId::proportional(38.0), col);
+                        paint_icon(ui, thumb.center(), 44.0, entry_icon(&e), col);
                     }
                     let name = if searching { e.display.clone().unwrap_or_else(|| e.name.clone()) } else { e.name.clone() };
                     let name_rect = Rect::from_min_size(pos2(rect.left() + 8.0, thumb.bottom() + 6.0), vec2(cell_w - 16.0, 20.0));
@@ -1227,7 +1194,7 @@ impl App {
                 });
             } else {
                 let col = if e.is_dir { p.accent } else { p.muted };
-                ui.painter().text(rect.center(), Align2::CENTER_CENTER, fsx::icon_for(&e), FontId::proportional(56.0), col);
+                paint_icon(ui, rect.center(), 64.0, entry_icon(&e), col);
             }
         }
         ui.add_space(12.0);
@@ -1312,14 +1279,16 @@ impl App {
             ui.add_space(16.0);
             ui.label(RichText::new(format!("Changements ({})", repo.changes.len())).size(15.0).strong());
             Frame::new().fill(p.soft).corner_radius(CornerRadius::same(10)).inner_margin(Margin::symmetric(8, 2)).show(ui, |ui| {
-                ui.label(RichText::new(format!("⎇ {}", repo.branch)).monospace().size(12.0));
+                let (ir, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                icons::paint(ui.painter(), ir, Icon::Git, p.text);
+                ui.label(RichText::new(&repo.branch).monospace().size(12.0));
             });
             if !repo.ahead.is_empty() {
                 ui.label(RichText::new(&repo.ahead).color(p.muted).size(12.0));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(12.0);
-                if ui.button("⟳").on_hover_text("Actualiser le statut git").clicked() {
+                if icons::button(ui, Icon::Refresh, 28.0, Look::tool(&p), "Actualiser le statut git").clicked() {
                     acts.push(Action::GitRefresh);
                 }
                 let all = repo.excluded.is_empty();
@@ -1373,7 +1342,7 @@ impl App {
                 let included = !repo.excluded.contains(&ch.rel);
                 ui.painter().rect(cb, CornerRadius::same(4), if included { p.accent } else { p.surface }, Stroke::new(1.5, if included { p.accent } else { p.border }), StrokeKind::Inside);
                 if included {
-                    ui.painter().text(cb.center(), Align2::CENTER_CENTER, "✔", FontId::proportional(11.0), p.on_accent);
+                    paint_icon(ui, cb.center(), 13.0, Icon::Check, p.on_accent);
                 }
                 if cb_resp.clicked() {
                     if included {
@@ -1662,51 +1631,28 @@ impl App {
         }
     }
 
-    fn draw_help(&mut self, ui: &mut Ui) {
-        if !self.show_help {
-            return;
-        }
+    /// Palette Ctrl+K (T5) et aide F1, toutes deux du socle, sur la même liste de commandes.
+    fn draw_palette_and_help(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
-        let mut open = true;
-        egui::Window::new("Raccourcis clavier").open(&mut open).collapsible(false).resizable(false).show(&ctx, |ui| {
-            egui::Grid::new("keys").num_columns(2).spacing(vec2(24.0, 4.0)).show(ui, |ui| {
-                for (k, v) in [
-                    ("Ctrl+T / Ctrl+W", "Nouvel onglet / fermer"),
-                    ("Ctrl+Tab", "Onglet suivant"),
-                    ("Ctrl+L", "Modifier le chemin"),
-                    ("Ctrl+F", "Filtrer / rechercher"),
-                    ("Alt+← / Alt+→ / Retour", "Précédent / suivant / parent"),
-                    ("Entrée", "Ouvrir"),
-                    ("F2", "Renommer"),
-                    ("Suppr / Maj+Suppr", "Corbeille / suppression définitive"),
-                    ("Ctrl+C / X / V", "Copier / couper / coller (compatible Explorateur)"),
-                    ("Ctrl+Maj+C", "Copier le chemin"),
-                    ("Ctrl+Maj+N", "Nouveau dossier"),
-                    ("Ctrl+A", "Tout sélectionner"),
-                    ("Ctrl+H", "Fichiers cachés"),
-                    ("Ctrl+Maj+L / Ctrl+Maj+G", "Liste / grille"),
-                    ("Ctrl+Maj+D", "Basculer Bureau / Dev"),
-                    ("Lettres", "Aller au fichier qui commence par…"),
-                    ("Glisser (+Ctrl)", "Déplacer (copier) vers un dossier"),
-                    ("Clic molette", "Ouvrir un dossier dans un onglet"),
-                    ("F5", "Actualiser"),
-                    ("Ctrl+P", "Aller à un dossier (fréquents et récents)"),
-                    ("F3", "Double volet"),
-                    ("F6 / Maj+F6", "Copier / déplacer vers l’autre volet"),
-                    ("Ctrl+Z", "Annuler la dernière opération"),
-                    ("Espace", "Aperçu plein écran (← → pour naviguer)"),
-                    ("F2 (plusieurs fichiers)", "Renommage en lot"),
-                    ("Maj+clic droit", "Menu complet de Windows"),
-                ] {
-                    ui.label(RichText::new(k).monospace().strong());
-                    ui.label(v);
-                    ui.end_row();
-                }
-            });
-        });
-        if !open {
-            self.show_help = false;
+        let p = self.pal;
+        let cmds = self.commands();
+        if self.goto.is_none() && self.batch.is_none() && self.fullview.is_none() {
+            self.palette.handle_shortcut(&ctx);
         }
+        if let Some(id) = self.palette.show(&ctx, &p, &cmds) {
+            self.run_command(&id);
+        }
+        // F1 : les commandes avec raccourci, plus quelques gestes sans commande.
+        let mut help = cmds;
+        let geste = |label: &str, keys: &str| Command::new("", label).group("Gestes").keys(keys).enabled(false);
+        help.extend([
+            geste("Ouvrir", "Entrée"),
+            geste("Aller au fichier qui commence par…", "Lettres"),
+            geste("Déplacer vers un dossier (copier avec Ctrl)", "Glisser"),
+            geste("Ouvrir un dossier dans un onglet", "Clic molette"),
+            geste("Étendre la sélection", "Maj+flèches"),
+        ]);
+        socle::ui::help_window(&ctx, &p, &mut self.show_help, &help);
     }
 }
 

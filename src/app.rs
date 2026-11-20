@@ -2,7 +2,7 @@
 use crate::fsx::{self, Entry};
 use crate::git::{self, DiffLine};
 use crate::ops::{Op, OpEvent, Ops};
-use crate::theme::{self, Palette};
+use socle::theme::{self, Palette};
 use crate::thumbs::Thumbs;
 use crate::winx;
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -42,6 +42,11 @@ pub struct Settings {
     /// Dossiers visités : nombre de visites et dernière visite (secondes Unix) → « Aller à ».
     pub visits: HashMap<String, (u32, i64)>,
     pub folder_sizes: bool,
+    /// Historiques d'autocomplétion (T4) : filtre et barre d'adresse.
+    pub filter_history: socle::autocomplete::History,
+    pub addr_history: socle::autocomplete::History,
+    /// Commandes récentes de la palette Ctrl+K (en tête de liste).
+    pub palette_recent: Vec<String>,
     /// Ouvrir images, PDF, Word, audio, vidéo, code dans le lecteur universel (double-clic, Entrée).
     pub use_viewer: bool,
     /// Espace = aperçu rapide dans le lecteur universel (sinon aperçu plein écran intégré).
@@ -51,8 +56,7 @@ pub struct Settings {
     /// Vérifier les mises à jour sur GitHub (au plus une fois par jour).
     pub auto_update: bool,
     pub last_update_check: i64,
-    /// Dernier plantage déjà signalé (secondes Unix).
-    pub crash_seen: i64,
+
 }
 
 impl Default for Settings {
@@ -71,12 +75,15 @@ impl Default for Settings {
             window: None,
             visits: HashMap::new(),
             folder_sizes: true,
+            filter_history: Default::default(),
+            addr_history: Default::default(),
+            palette_recent: Vec::new(),
             use_viewer: true,
             quick_viewer: true,
             global_index: true,
             auto_update: true,
             last_update_check: 0,
-            crash_seen: 0,
+
         }
     }
 }
@@ -335,7 +342,7 @@ pub enum Action {
 }
 
 pub enum UpdateMsg {
-    Checked { manual: bool, res: Result<Option<crate::updater::Release>, String> },
+    Checked { manual: bool, res: Result<Option<socle::update::Release>, String> },
     Installed(Result<(), String>),
 }
 
@@ -416,46 +423,73 @@ pub struct App {
     pub batch: Option<BatchRename>,
     /// Exe du lecteur universel, s'il est installé.
     pub viewer: Option<PathBuf>,
+    // --- autocomplétion (T4) ---
+    pub filter_ac: socle::autocomplete::Autocomplete,
+    pub filter_field: socle::ui::AutoField,
+    filter_ac_for: Option<(u64, u64, usize)>,
+    pub addr_ac: socle::autocomplete::Autocomplete,
+    pub addr_field: socle::ui::AutoField,
+    pub addr_focused: bool,
+    addr_cand_for: String,
+    addr_tx: Sender<(String, Vec<String>)>,
+    addr_rx: Receiver<(String, Vec<String>)>,
+    // --- palette Ctrl+K (T5) ---
+    pub palette: socle::ui::Palette,
     /// Repli de l'aperçu rapide : le lecteur n'a pas pu s'ouvrir → aperçu intégré pour ce fichier.
     preview_fallback_tx: Sender<PathBuf>,
     preview_fallback_rx: Receiver<PathBuf>,
     pub index: Option<crate::index::Index>,
     /// Mise à jour disponible (bandeau dans la barre d'état).
-    pub update: Option<crate::updater::Release>,
+    pub update: Option<socle::update::Release>,
     pub update_busy: Option<&'static str>,
     update_tx: Sender<UpdateMsg>,
     update_rx: Receiver<UpdateMsg>,
     /// Dossiers demandés par une autre instance (boîte aux lettres).
     inbox_rx: Receiver<String>,
+    /// Pour l'écoute de l'instance unique (main.rs) : chaque message = un dossier ("" = au premier plan).
+    pub inbox_tx: Sender<String>,
+    /// Pour l'écoute de l'instance unique (main.rs) : chaque message = un dossier (\
     pub bring_front: bool,
     /// Cette app est-elle l'explorateur par défaut (Win+E, dossiers) ?
     pub is_default: bool,
 }
 
+/// Nom de l'app pour le socle (dossiers %APPDATA% / %LOCALAPPDATA%, tube, mutex).
+pub const APP: &str = "Explorateur";
+
+/// Mise à jour depuis les releases GitHub (socle::update).
+pub const UPDATER: socle::update::Updater =
+    socle::update::Updater { repo: "Desarrh/explorateur", current: env!("CARGO_PKG_VERSION"), asset_suffix: "windows-x64.zip", exe_name: None };
+
 impl Settings {
-    /// Réglages dans un simple fichier JSON (%APPDATA%\Explorateur\settings.json).
-    fn file() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("Explorateur").join("settings.json"))
-    }
+    /// `%APPDATA%\Explorateur\settings.json` (socle : même fichier qu'avant, écriture atomique).
     pub fn load() -> Settings {
-        Self::file()
-            .and_then(|f| std::fs::read(f).ok())
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        socle::settings::load(APP)
     }
     pub fn save(&self) {
-        if let Some(f) = Self::file() {
-            if let Some(dir) = f.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Ok(b) = serde_json::to_vec_pretty(self) {
-                let tmp = f.with_extension("json.tmp");
-                if std::fs::write(&tmp, b).is_ok() {
-                    let _ = std::fs::rename(tmp, f);
-                }
-            }
-        }
+        let _ = socle::settings::save(APP, self);
     }
+}
+
+/// Polices du socle **sans** la police emoji (seguiemj.ttf, 13 Mo gardés en RAM) ni le gras
+/// (1 à 2 Mo, servait seulement au mot « PDF » de l'icône) : les icônes sont vectorielles et les
+/// rares pictogrammes (⬆ ✓) sont dans Segoe UI Symbol. RAM identique à avant la migration.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    for (name, file, family, first) in [
+        ("segoe", "segoeui.ttf", egui::FontFamily::Proportional, true),
+        ("consolas", "consola.ttf", egui::FontFamily::Monospace, true),
+        ("segsym", "seguisym.ttf", egui::FontFamily::Proportional, false),
+    ] {
+        let Ok(b) = std::fs::read(format!(r"C:\Windows\Fonts\{file}")) else { continue };
+        fonts.font_data.insert(name.into(), egui::FontData::from_owned(b).into());
+        let list = fonts.families.entry(family).or_default();
+        if first { list.insert(0, name.into()) } else { list.push(name.into()) }
+    }
+    // Famille « bold » attendue par certains composants du socle : repli sur la police normale.
+    let prop = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+    fonts.families.insert(egui::FontFamily::Name("bold".into()), prop);
+    ctx.set_fonts(fonts);
 }
 
 /// Petit alias pour garder le nom `git` libre pour le module.
@@ -464,7 +498,7 @@ type Git2 = git::Git;
 impl App {
     pub fn new(ctx: &egui::Context, s: Settings) -> App {
         let ctx = ctx.clone();
-        theme::install_fonts(&ctx);
+        install_fonts(&ctx);
         let pal = theme::palette(s.dark);
         theme::apply(&ctx, &pal);
         ctx.all_styles_mut(|st| {
@@ -498,25 +532,13 @@ impl App {
         add("Vidéos", dirs::video_dir());
         add("Dossier perso", dirs::home_dir());
 
+        // Dossiers transmis par une 2ᵉ instance (socle::instance, branché dans main.rs) :
+        // plus de sondage, le thread du socle dort dans le tube nommé (0 % CPU au repos).
         let (inbox_tx, inbox_rx) = unbounded();
-        let c3 = ctx.clone();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_millis(250));
-                let reqs = winx::single::take_requests();
-                if reqs.is_empty() {
-                    continue;
-                }
-                for r in reqs {
-                    if inbox_tx.send(r).is_err() {
-                        return;
-                    }
-                }
-                c3.request_repaint();
-            }
-        });
 
         let (utx, urx) = unbounded();
+        let (atx, arx) = unbounded();
+        let (filter_hist, addr_hist, palette_recent) = (s.filter_history.clone(), s.addr_history.clone(), s.palette_recent.clone());
         let (pftx, pfrx) = unbounded();
         let mut app = App {
             drag_out: None,
@@ -530,6 +552,16 @@ impl App {
             fullview: None,
             batch: None,
             viewer: crate::viewer::find(),
+            filter_ac: socle::autocomplete::Autocomplete::new(filter_hist),
+            filter_field: Default::default(),
+            filter_ac_for: None,
+            addr_ac: socle::autocomplete::Autocomplete::new(addr_hist),
+            addr_field: Default::default(),
+            addr_focused: false,
+            addr_cand_for: String::new(),
+            addr_tx: atx,
+            addr_rx: arx,
+            palette: { let mut pal = socle::ui::Palette::default(); pal.recent = palette_recent; pal },
             preview_fallback_tx: pftx,
             preview_fallback_rx: pfrx,
             index: None,
@@ -538,6 +570,7 @@ impl App {
             update_tx: utx,
             update_rx: urx,
             inbox_rx,
+            inbox_tx,
             bring_front: false,
             #[cfg(windows)]
             is_default: winx::default_explorer::is_enabled(),
@@ -597,18 +630,9 @@ impl App {
         if app.s.auto_update && now - app.s.last_update_check > 24 * 3600 {
             app.start_update_check(false);
         }
-        // Plantage depuis la dernière fois ? On le signale une fois.
-        if let Some(log) = dirs::config_dir().map(|d| d.join("Explorateur").join("crash.log")) {
-            let mtime = std::fs::metadata(&log)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            if mtime > app.s.crash_seen {
-                app.s.crash_seen = mtime;
-                app.toast(format!("L’explorateur s’est fermé brutalement la dernière fois — détails : {}", log.display()), true);
-            }
+        // Plantage depuis la dernière fois ? On le signale une fois (socle::crash).
+        if let Some(msg) = socle::crash::pending(APP) {
+            app.toast(format!("L’explorateur s’est fermé brutalement la dernière fois ({msg}) — détails : {}", socle::crash::log_path(APP).display()), true);
         }
         app
     }
@@ -616,7 +640,69 @@ impl App {
     pub fn settings_for_save(&mut self) -> &Settings {
         self.s.tabs = self.tabs.iter().map(|t| t.path.clone()).collect();
         self.s.active = self.active;
+        self.s.palette_recent = self.palette.recent.clone();
         &self.s
+    }
+
+    /// Dossiers les plus visités (candidats de l'adresse et de « Aller à »).
+    fn top_visits(&self, n: usize) -> Vec<String> {
+        let mut v: Vec<(&String, &(u32, i64))> = self.s.visits.iter().collect();
+        v.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(b.1.1.cmp(&a.1.1)));
+        v.into_iter().take(n).map(|(k, _)| k.clone()).collect()
+    }
+
+    /// Candidats de l'autocomplétion de la barre d'adresse : sous-dossiers du dossier parent de
+    /// ce qui est tapé (lus sur un thread, jamais sur le fil de l'interface) + dossiers fréquents.
+    pub fn refresh_address_candidates(&mut self, text: &str) {
+        while let Ok((key, mut list)) = self.addr_rx.try_recv() {
+            if key == self.addr_cand_for {
+                list.extend(self.top_visits(300));
+                self.addr_ac.set_candidates(list);
+            }
+        }
+        let t = text.trim().trim_matches('"');
+        let parent = match t.rfind('\\') {
+            Some(i) => t[..=i].to_string(),
+            None => String::new(),
+        };
+        if parent == self.addr_cand_for && !self.addr_ac.candidates().is_empty() {
+            return;
+        }
+        self.addr_cand_for = parent.clone();
+        // Tout de suite : les dossiers fréquents (jamais de liste vide pendant la lecture).
+        let visits = self.top_visits(300);
+        self.addr_ac.set_candidates(visits);
+        if parent.is_empty() {
+            return;
+        }
+        let (tx, ctx) = (self.addr_tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&parent) {
+                for e in rd.flatten().take(5000) {
+                    if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        out.push(format!("{}{}", parent, e.file_name().to_string_lossy()));
+                    }
+                }
+            }
+            let _ = tx.send((parent, out));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Candidats du filtre : les noms du dossier affiché (mis à jour quand il change).
+    fn refresh_filter_candidates(&mut self) {
+        let t = &self.tabs[self.active];
+        if t.loading {
+            return;
+        }
+        let key = (t.id, t.generation, t.entries.len());
+        if self.filter_ac_for == Some(key) {
+            return;
+        }
+        self.filter_ac_for = Some(key);
+        let names: Vec<String> = t.entries.iter().take(20_000).map(|e| e.name.clone()).collect();
+        self.filter_ac.set_candidates(names);
     }
 
     pub fn tab(&self) -> &Tab {
@@ -732,7 +818,7 @@ impl App {
                 if searching || needle.is_empty() {
                     Some((i, 0))
                 } else {
-                    fsx::fuzzy_score(&e.lower, &needle).map(|s| (i, s))
+                    socle::fuzzy::score(&e.name, &needle).map(|s| (i, s))
                 }
             })
             .collect();
@@ -1194,6 +1280,7 @@ impl App {
     /// Appelé à chaque image, avant le dessin.
     pub fn tick(&mut self) {
         self.process_updates();
+        self.refresh_filter_candidates();
         // Le lecteur n'a pas répondu à un aperçu rapide : aperçu intégré, sans message d'erreur.
         while let Ok(p) = self.preview_fallback_rx.try_recv() {
             self.fullview = Some(p);
@@ -1278,8 +1365,16 @@ impl App {
     pub fn handle_keys(&mut self) {
         let ctx = self.ctx.clone();
         // Fenêtres modales : elles gèrent leurs propres touches.
-        if self.goto.is_some() || self.batch.is_some() {
+        if self.goto.is_some() || self.batch.is_some() || self.palette.is_open() || self.show_help {
             return;
+        }
+        // Ctrl+1 / Ctrl+2 : liste / grille, par la touche physique (marche aussi en AZERTY).
+        if !ctx.egui_wants_keyboard_input() {
+            match socle::keys::consume_ctrl_digit(&ctx) {
+                Some(1) => self.s.grid = false,
+                Some(2) => self.s.grid = true,
+                _ => {}
+            }
         }
         if let Some(cur) = self.fullview.clone() {
             use egui::{Key, Modifiers as M};
@@ -1381,14 +1476,12 @@ impl App {
                 let p = self.tabs[self.active].path.to_string_lossy().into_owned();
                 self.tabs[self.active].address = Some(p);
             }
-            if i.consume_key(M::COMMAND, Key::F) || i.consume_key(M::COMMAND, Key::K) {
+            // (Ctrl+K = palette de commandes, F1 = aide : gérés par le socle dans draw())
+            if i.consume_key(M::COMMAND, Key::F) {
                 focus_search = true;
             }
             if i.consume_key(M::NONE, Key::F5) {
                 acts.push(Action::Refresh);
-            }
-            if i.consume_key(M::NONE, Key::F1) {
-                self.show_help = !self.show_help;
             }
             if i.consume_key(M::COMMAND, Key::P) {
                 acts.push(Action::OpenGoto);
@@ -1407,20 +1500,6 @@ impl App {
             }
             if i.consume_key(M::COMMAND | M::SHIFT, Key::D) {
                 self.s.dev = !self.s.dev;
-            }
-            for ev in &i.events {
-                if let egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } = ev {
-                    if !modifiers.command {
-                        continue;
-                    }
-                    let k = physical_key.unwrap_or(*key);
-                    if k == Key::Num1 || *key == Key::Num1 {
-                        self.s.grid = false;
-                    }
-                    if k == Key::Num2 || *key == Key::Num2 {
-                        self.s.grid = true;
-                    }
-                }
             }
             if i.consume_key(M::ALT, Key::ArrowLeft) || i.pointer.button_pressed(egui::PointerButton::Extra1) {
                 acts.push(Action::Back);
@@ -1957,7 +2036,7 @@ impl App {
                     self.update_busy = Some("Téléchargement de la mise à jour…");
                     let (tx, ctx) = (self.update_tx.clone(), self.ctx.clone());
                     std::thread::spawn(move || {
-                        let res = crate::updater::install(&r);
+                        let res = UPDATER.install(&r, &|_| {}).and_then(|exe| socle::update::relaunch(&exe));
                         let _ = tx.send(UpdateMsg::Installed(res));
                         ctx.request_repaint();
                     });
@@ -2010,7 +2089,7 @@ impl App {
         self.update_busy = Some("Recherche de mise à jour…");
         let (tx, ctx) = (self.update_tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
-            let res = crate::updater::check();
+            let res = UPDATER.check();
             let _ = tx.send(UpdateMsg::Checked { manual, res });
             ctx.request_repaint();
         });

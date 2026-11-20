@@ -3,6 +3,7 @@
 use crate::app::{Action, App};
 use crate::fsx;
 use egui::{pos2, vec2, Align2, Color32, CornerRadius, FontId, Frame, Margin, Rect, RichText, Sense, Stroke, Ui};
+use socle::icons::{self, Icon};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -42,8 +43,8 @@ impl App {
                 let low = path.to_lowercase();
                 let base = Path::new(&path).file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
                 // Le nom du dossier compte plus que le chemin complet
-                let s_base = fsx::fuzzy_score(&base, &q).map(|s| s as f32 + 400.0);
-                let s_full = fsx::fuzzy_score(&low, &q).map(|s| s as f32);
+                let s_base = socle::fuzzy::score(&base, &q).map(|s| s as f32 + 400.0);
+                let s_full = socle::fuzzy::score(&low, &q).map(|s| s as f32);
                 s_base.or(s_full).map(|s| (s + frec * 3.0, path))
             })
             .collect();
@@ -144,7 +145,8 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_width(w);
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("📁").color(p.accent).size(16.0));
+                            let (ir, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                            icons::paint(ui.painter(), ir, Icon::Folder, p.accent);
                             let r = ui.add(
                                 egui::TextEdit::singleline(&mut g.query)
                                     .hint_text("Aller à un dossier… (tape quelques lettres)")
@@ -176,8 +178,9 @@ impl App {
                             if on || resp.hovered() {
                                 ui.painter().rect_filled(rect, CornerRadius::same(8), if on { p.sel_bg } else { p.hover_bg });
                             }
-                            let icon = if *is_dir { "📁" } else { "📄" };
-                            ui.painter().text(pos2(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, icon, FontId::proportional(15.0), if *is_dir { p.accent } else { p.muted });
+                            let icon = if *is_dir { Icon::Folder } else { Icon::for_extension(pb.extension().and_then(|e| e.to_str()).unwrap_or("")) };
+                            let ir = Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(17.0, 17.0));
+                            icons::paint(ui.painter(), ir, icon, if *is_dir { p.accent } else { p.muted });
                             ui.painter().text(pos2(rect.left() + 38.0, rect.top() + 12.0), Align2::LEFT_CENTER, name, FontId::proportional(14.5), p.text);
                             let parent = pb.parent().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
                             ui.painter().text(pos2(rect.left() + 38.0, rect.top() + 29.0), Align2::LEFT_CENTER, &parent, FontId::proportional(11.5), p.muted);
@@ -264,8 +267,8 @@ impl App {
                     ui.label(RichText::new(t).monospace().size(13.0).color(self.pal.text));
                 });
             } else {
-                let icon = fsx::icon_for(&e);
-                ui.painter().text(content.center(), Align2::CENTER_CENTER, icon, FontId::proportional(120.0), Color32::from_gray(200));
+                let icon = crate::ui::entry_icon(&e);
+                icons::paint(ui.painter(), Rect::from_center_size(content.center(), vec2(120.0, 120.0)), icon, Color32::from_gray(200));
                 if e.has_thumb() {
                     ui.painter().text(content.center() + vec2(0.0, 90.0), Align2::CENTER_TOP, "chargement…", FontId::proportional(14.0), Color32::from_gray(160));
                 }

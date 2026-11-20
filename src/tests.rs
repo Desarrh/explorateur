@@ -208,9 +208,85 @@ fn apercu_rapide_repli_silencieux() {
     assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(3)).ok(), Some(f));
 }
 
+/// Mesure sans fenêtre (règle n°0 : rien à l'écran, aucun focus pris) : l'app complète tourne
+/// avec egui + le rendu CPU dans un tampon en mémoire, sur un dossier de 10 000 fichiers.
+/// Mesure le temps jusqu'à la première image où la liste est affichée, et la mémoire du processus.
+/// `cargo test --release bench_affichage -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_affichage() {
+    use egui_software_backend::{BufferMutRef, ColorFieldOrder, EguiSoftwareRender};
+    let d = tmpdir("bench10k");
+    for i in 0..10_000 {
+        std::fs::write(d.join(format!("fichier {i:05}.txt")), b"x").unwrap();
+    }
+    let (w, h) = (1280usize, 800usize);
+    let mut buf = vec![[0u8; 4]; w * h];
+    let mut renderer = EguiSoftwareRender::new(ColorFieldOrder::Bgra);
+    let frame = |ctx: &egui::Context, app: &mut crate::app::App, renderer: &mut EguiSoftwareRender, buf: &mut Vec<[u8; 4]>| {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32))),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(raw, |ui| {
+            app.tick();
+            app.draw(ui);
+            app.apply_actions();
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        renderer.render(&mut BufferMutRef::new(buf, w, h), &prims, &out.textures_delta, out.pixels_per_point);
+    };
+    let t0 = std::time::Instant::now();
+    let ctx = egui::Context::default();
+    let s = crate::app::Settings {
+        tabs: vec![d.clone()],
+        global_index: false,
+        auto_update: false,
+        folder_sizes: false,
+        ..Default::default()
+    };
+    let mut app = crate::app::App::new(&ctx, s);
+    let t_new = t0.elapsed();
+    frame(&ctx, &mut app, &mut renderer, &mut buf);
+    let t_first = t0.elapsed();
+    // On attend que la liste soit chargée, triée et dessinée.
+    let mut frames = 1;
+    while (app.tab().loading || app.tab().view.len() < 10_000) && t0.elapsed().as_secs() < 10 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        frame(&ctx, &mut app, &mut renderer, &mut buf);
+        frames += 1;
+    }
+    frame(&ctx, &mut app, &mut renderer, &mut buf);
+    let t_list = t0.elapsed();
+    // image suivante, sans changement : coût d'un rafraîchissement à l'état stable
+    let t1 = std::time::Instant::now();
+    frame(&ctx, &mut app, &mut renderer, &mut buf);
+    let t_steady = t1.elapsed();
+    let ram = mem_mb();
+    println!(
+        "10 000 fichiers : App::new {:.1} ms, 1re image {:.1} ms, liste affichée {:.1} ms ({frames} images), image stable {:.1} ms, RAM du processus {ram:.0} Mo (privé)",
+        t_new.as_secs_f64() * 1e3,
+        t_first.as_secs_f64() * 1e3,
+        t_list.as_secs_f64() * 1e3,
+        t_steady.as_secs_f64() * 1e3,
+    );
+    assert_eq!(app.tab().view.len(), 10_000);
+    drop(app);
+    let _ = std::fs::remove_dir_all(d);
+}
+
+/// Mémoire privée du processus (Mo).
+fn mem_mb() -> f64 {
+    let out = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {}).PrivateMemorySize64", std::process::id())])
+        .output()
+        .ok();
+    out.and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok()).unwrap_or(0.0) / 1_048_576.0
+}
+
 #[test]
 fn comparaison_de_versions() {
-    use crate::updater::is_newer;
+    use socle::update::is_newer;
     assert!(is_newer("v0.3.0", "0.2.0"));
     assert!(is_newer("v0.2.1", "0.2.0"));
     assert!(is_newer("1.0", "0.9.9"));
@@ -237,4 +313,18 @@ fn taille_de_dossier() {
     assert!(s.invalidate(&d.join("a").join("x.bin")));
     assert!(!s.map.contains_key(Path::new(&d.join("a"))));
     let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn miniature_avec_cache_disque() {
+    let d = tmpdir("miniature");
+    let png = d.join("a.png");
+    image::RgbaImage::from_pixel(600, 300, image::Rgba([200, 50, 50, 255])).save(&png).unwrap();
+    let disk = socle::images::DiskCache { dir: d.join("cache") };
+    let img = crate::thumbs::decode(&png, 128, &disk).expect("miniature");
+    assert_eq!(img.size, [128, 64]);
+    // 2ᵉ passage : servie par le cache disque
+    assert!(std::fs::read_dir(&disk.dir).unwrap().count() >= 1);
+    assert_eq!(crate::thumbs::decode(&png, 128, &disk).unwrap().size, [128, 64]);
+    let _ = std::fs::remove_dir_all(&d);
 }

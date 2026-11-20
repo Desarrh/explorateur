@@ -2,6 +2,7 @@
 #![allow(deprecated)]
 
 mod app;
+mod commands;
 mod extras;
 mod fsx;
 mod git;
@@ -10,10 +11,8 @@ mod ops;
 mod sizes;
 #[cfg(test)]
 mod tests;
-mod theme;
 mod thumbs;
 mod ui;
-mod updater;
 mod viewer;
 mod winx;
 
@@ -49,6 +48,8 @@ struct Runner {
     app: Option<app::App>,
     settings: Option<app::Settings>,
     next_repaint: Option<Instant>,
+    /// Instance principale : écoute les instances suivantes une fois l'app créée.
+    instance: Option<socle::instance::Instance>,
 }
 
 impl Runner {
@@ -164,7 +165,16 @@ impl ApplicationHandler<UserEvent> for Runner {
         let renderer = EguiSoftwareRender::new(ColorFieldOrder::Bgra);
         if self.app.is_none() {
             let s = self.settings.take().unwrap_or_default();
-            self.app = Some(app::App::new(&self.ctx, s));
+            let app = app::App::new(&self.ctx, s);
+            // Une 2ᵉ instance transmet son dossier par le tube du socle (< 1 ms, 0 % CPU au repos).
+            if let Some(inst) = self.instance.take() {
+                let (tx, ctx) = (app.inbox_tx.clone(), self.ctx.clone());
+                inst.listen(move |args| {
+                    let _ = tx.send(args.into_iter().next().unwrap_or_default());
+                    ctx.request_repaint();
+                });
+            }
+            self.app = Some(app);
         }
         window.request_redraw();
         self.gfx = Some(Gfx { window, egui, _context: context, surface, renderer });
@@ -223,45 +233,25 @@ fn window_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
-/// Journal de plantage : %APPDATA%\Explorateur\crash.log (message, emplacement, pile d'appels).
-fn install_crash_log() {
-    let default = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if let Some(dir) = dirs::config_dir().map(|d| d.join("Explorateur")) {
-            let _ = std::fs::create_dir_all(&dir);
-            let bt = std::backtrace::Backtrace::force_capture();
-            let thread = std::thread::current().name().unwrap_or("?").to_string();
-            let entry = format!(
-                "==== {} · v{} · thread {thread}\n{info}\n{bt}\n",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                env!("CARGO_PKG_VERSION"),
-            );
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("crash.log")) {
-                let _ = f.write_all(entry.as_bytes());
-            }
-        }
-        default(info);
-    }));
-}
-
 fn main() {
-    install_crash_log();
-    updater::cleanup_old();
-    // Relancé par une mise à jour : l'ancienne instance est en train de se fermer, on ne lui transmet rien.
-    let after_update = std::env::args().any(|a| a == "--after-update");
+    // Journal de plantage (%APPDATA%\Explorateur\crash.log) et nettoyage d'une mise à jour.
+    socle::crash::install(app::APP, env!("CARGO_PKG_VERSION"));
+    socle::update::cleanup_old();
+    // Relancé par une mise à jour : l'ancienne instance est en train de se fermer.
+    let after_update = socle::update::is_after_update();
     if after_update {
         std::thread::sleep(std::time::Duration::from_millis(800));
     }
-    // Déjà ouvert ? On transmet le dossier à la fenêtre existante (nouvel onglet) et on s'arrête.
-    #[cfg(windows)]
-    if !after_update && winx::single::another_running() {
-        let arg = std::env::args().nth(1).map(std::path::PathBuf::from).filter(|p| p.is_dir());
-        if winx::single::forward(arg) {
-            return;
-        }
+    // Déjà ouvert ? Le dossier part à la fenêtre existante (nouvel onglet) et on s'arrête.
+    let dir_arg: Vec<String> =
+        std::env::args().skip(1).filter(|a| !a.starts_with("--")).take(1).filter(|a| std::path::Path::new(a).is_dir()).collect();
+    // (après une mise à jour, l'ancienne fenêtre a eu 0,8 s pour se fermer et rendre le mutex)
+    let mut instance = None;
+    match socle::instance::start(app::APP, &dir_arg) {
+        socle::instance::Start::Forwarded if !after_update => return,
+        socle::instance::Start::Primary(i) => instance = Some(i),
+        _ => {}
     }
-    let _ = winx::single::take_requests(); // demandes périmées d'une session précédente
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("boucle d’événements");
     let proxy = event_loop.create_proxy();
@@ -270,7 +260,7 @@ fn main() {
     ctx.set_request_repaint_callback(move |info| {
         let _ = p2.send_event(UserEvent::RepaintAt(Instant::now() + info.delay));
     });
-    let mut runner = Runner { ctx, proxy, gfx: None, app: None, settings: Some(app::Settings::load()), next_repaint: None };
+    let mut runner = Runner { ctx, proxy, gfx: None, app: None, settings: Some(app::Settings::load()), next_repaint: None, instance };
     let _ = event_loop.run_app(&mut runner);
     let _ = &runner.proxy;
 }

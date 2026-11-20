@@ -10,7 +10,7 @@ Tout ce qui suit est relevé dans le code de `main` (commit `1cef86d`, version 0
 - **Ce qu'il remplace** : l'Explorateur Windows au quotidien (il peut devenir l'explorateur par défaut :
   Win+E et dossiers ouverts depuis le Bureau ou d'autres applis). Le Bureau et la barre des tâches restent à Windows.
 - **Principes** :
-  - léger : rendu CPU sans contexte GPU (~40–45 Mo de RAM, exe unique de ~11 Mo) ;
+  - léger : rendu CPU sans contexte GPU (~40–45 Mo de RAM, exe unique de ~13,7 Mo) ;
   - jamais bloquer l'interface : tout ce qui touche au disque, au réseau ou à git tourne sur des threads ;
   - pas de droits admin, pas d'installateur, réglages dans un simple fichier JSON ;
   - comportement Windows natif là où ça compte (presse-papiers, glisser-déposer, menu clic droit, miniatures).
@@ -24,9 +24,10 @@ Tout ce qui suit est relevé dans le code de `main` (commit `1cef86d`, version 0
 | Fenêtre / entrées | `winit` 0.30.13 + `egui-winit` 0.37.0 (features `clipboard`, `links`), boucle d'événements écrite à la main (pas d'eframe) |
 | Rendu | CPU : `hdrshot-egui-backend` 0.2.0 (rastériseur egui logiciel, cache par tuiles de 64 px, crate `egui_software_backend`) + `softbuffer` 0.4.8 (présentation GDI). Ordre des pixels `Bgra` |
 | Fichiers | `notify` 8.2.2 (suivi live), `trash` 5.4.0 (corbeille + restauration), `open` 5.4.5, `zip` 9.7.3 (deflate), `ignore` 0.4.34 (parcours ripgrep, `.gitignore`), `rayon` 1.12.0, `memchr` 2.8.3 |
-| Images | `image` 0.25.10 (png, jpeg, gif, webp, bmp, ico) |
+| Socle commun | [`socle`](https://github.com/Desarrh/socle) v0.1.0 (tag git ; en local `.cargo/config.toml` le remplace par `../socle`, fichier ignoré par git), features `ui images img-svg img-wic settings crash instance update` : thème, icônes vectorielles, composants (champ avec autocomplétion, palette Ctrl+K, aide F1, contrôle segmenté), recherche floue, raccourcis (`keys`), miniatures + cache disque, réglages, journal de plantage, instance unique, mise à jour |
+| Images | décodeurs du socle (`socle::images` : png, jpeg, gif, webp, bmp, ico, tiff, qoi, svg, + tout ce que WIC sait lire : HEIC, AVIF, RAW…) ; `image` 0.25.10 reste pour l'icône de fenêtre et les tests |
 | Divers | `crossbeam-channel` 0.5.17, `serde`/`serde_json` 1, `chrono` 0.4.45, `dirs` 7.0.0, `regex` 1.13.2, `bytemuck` 1, `drag` 2.1.1 (glisser vers l'extérieur) |
-| API Windows | `windows-sys` 0.61.2 (FindFirstFileExW, GetDiskFreeSpaceExW, presse-papiers CF_HDROP, registre, mutex nommé, ShellExecuteExW « properties », GetAsyncKeyState) et `windows` 0.58 (IShellItemImageFactory pour les miniatures, IContextMenu/2/3 + SetWindowSubclass pour le menu natif, GDI) |
+| API Windows | `windows-sys` 0.61.2 (FindFirstFileExW, GetDiskFreeSpaceExW, presse-papiers CF_HDROP, registre, ShellExecuteExW « properties », GetAsyncKeyState) et `windows` 0.62, comme le socle (IShellItemImageFactory pour les miniatures, IContextMenu/2/3 + SetWindowSubclass pour le menu natif, GDI) |
 | Build | `build.rs` + `winresource` 0.1.34 : icône `assets/icon.ico` et nom « Explorateur » intégrés à l'exe |
 | Outils externes (optionnels) | `git` (vue Dev), `curl.exe` (mises à jour, fourni avec Windows 10/11), Windows Terminal / PowerShell, VS Code (`code`), app Claude (lien `claude://code/new?folder=`), [lecteur universel](https://github.com/Desarrh/lecteur-universel) |
 
@@ -42,32 +43,34 @@ Profil release : `lto = "thin"`, `codegen-units = 4`, `strip = true`. En dev, d�
 | `src/app.rs` | État (`App`, `Tab`, `Repo`, `Settings`), actions (`enum Action`), suivi live, tri/filtre, git, raccourcis clavier |
 | `src/ui.rs` | Dessin : onglets, barre d'outils, barre latérale, liste et grille virtualisées, double volet, aperçu, vue Dev, fenêtres |
 | `src/extras.rs` | Palette « Aller à » (Ctrl+P), aperçu plein écran (Espace), renommage en lot |
-| `src/theme.rs` | Palettes clair/sombre, application aux `Visuals` egui, polices |
-| `src/fsx.rs` | Lecture des dossiers, `Entry`, formats taille/date, icônes, recherche floue |
-| `src/thumbs.rs` | Miniatures sur 2–4 threads (décodeur Rust, sinon fournisseur Windows) |
+| `src/commands.rs` | Liste des commandes de la palette Ctrl+K et de l'aide F1 (`App::commands`, `App::run_command`) |
+| `src/fsx.rs` | Lecture des dossiers, `Entry`, formats taille/date, types de fichiers |
+| `src/thumbs.rs` | Miniatures sur 2–4 threads (décodeurs du socle + cache disque QOI, sinon fournisseur Windows) |
 | `src/ops.rs` | File d'opérations (copie, déplacement, corbeille, zip, conversion) avec annulation |
 | `src/sizes.rs` | Taille des dossiers en parallèle (rayon + FindFirstFileExW), cache des sous-dossiers |
 | `src/index.rs` | Index global des noms de fichiers (Ctrl+P), sauvegardé sur disque |
 | `src/git.rs` | Statut, diff, commit, push, restauration (appels à `git` sans fenêtre console) |
-| `src/winx.rs` | Presse-papiers de fichiers, menu Windows natif, explorateur par défaut (registre HKCU), instance unique, Claude Code |
-| `src/viewer.rs` | Lien avec le lecteur universel (ouvrir, `--convert`) |
-| `src/updater.rs` | Mise à jour depuis les releases GitHub |
-| `src/tests.rs` | Tests unitaires (`cargo test --release`) + 2 benchmarks ignorés |
+| `src/winx.rs` | Presse-papiers de fichiers, menu Windows natif, explorateur par défaut (registre HKCU), Claude Code, ouvrir avec, terminal |
+| `src/viewer.rs` | Lien avec le lecteur universel (ouvrir, aperçu rapide par tube, `--convert`) |
+| `src/tests.rs` | Tests unitaires (`cargo test --release`) + 3 benchmarks ignorés (`bench_affichage` : 10 000 fichiers sans fenêtre) |
 
 **Flux de données** : à chaque image, `App::tick()` vide les canaux (chargements de dossiers, événements
-`notify`, résultats git, opérations, miniatures, tailles, index, mises à jour, boîte aux lettres d'instance),
+`notify`, résultats git, opérations, miniatures, tailles, index, mises à jour, dossiers reçus d'une 2ᵉ instance),
 puis `handle_keys()`, puis `draw()` qui ne fait que **collecter des `Action`**, appliquées ensuite par
 `apply_actions()`. Le dessin ne modifie jamais l'état directement (évite les conflits d'emprunt).
 Les événements disque sont regroupés par image et appliqués en place à la liste (pas de rechargement).
 
 **Threads** : boucle UI (principal) ; 1 thread par chargement de dossier ; 2–4 miniatures ; 1 file
 d'opérations ; 1 git ; 1 pool rayon (4–16) pour les tailles ; 1 index ; pool `ignore` pour la recherche
-récursive ; watcher `notify` ; 1 sondage de la boîte aux lettres (250 ms) ; threads ponctuels (mise à jour).
+récursive ; watcher `notify` ; 1 écoute du tube d'instance (bloquante, 0 % CPU) ; 1 ménage du cache de
+miniatures au lancement ; threads ponctuels (mise à jour, candidats d'autocomplétion de la barre d'adresse).
 Repaint demandé par les threads via `ctx.request_repaint()` → `EventLoopProxy`.
 
 ## 4. Direction artistique
 
-Défini dans **`src/theme.rs`** (`palette()`, `apply()`, `install_fonts()`) ; dimensions dans `src/ui.rs` et `src/app.rs`.
+Défini dans le **socle** (`socle::theme` : `palette()`, `apply()`, `taille`, `arrondi`, `dim`) ; polices
+chargées par `app::install_fonts` (celles du socle **sans** la police emoji ni le gras : −13 Mo de RAM) ;
+dimensions propres à l'explorateur dans `src/ui.rs` et `src/app.rs`.
 Maquettes d'origine : canevas Claude Design « Explorateur Rust », artboard « B retenu ».
 
 ### Couleurs (`Palette`)
@@ -116,17 +119,20 @@ Le logo (`assets/icon.png`, généré par `assets/make_icon.py`) : dossier crèm
 
 ### Icônes et signes
 
-- Pas de pack d'icônes : glyphes monochromes de la police emoji d'egui, colorés par le thème
-  (`fsx::icon_for`) : 📁 dossier (`accent`), 📄 fichier, 🖼 image, 📝 texte/code, 🎵, 🎞, 📦, ⚙, 📕.
-- Barre d'outils : ← → ↑ ⟳, 🔍, ⤵ (recherche récursive), ▦ / ☰, ☀ / 🌙, ⋯ ; ⎇ dépôt git, 📌 épinglé, 🖴 disque.
+- **Icônes vectorielles du socle** (`socle::icons`, grille 24 × 24, traits colorés par le thème) :
+  `Icon::for_extension` pour les fichiers (`ui::entry_icon`), `Icon::Folder` en `accent`.
+- Barre d'outils : `icons::button` (32 px, `Look::tool` / `Look::active`) — ArrowLeft/Right/Up, Refresh,
+  Grid / ListView, Sun / Moon, More (menu ⋯) ; barre latérale Git, Folder, Pin, Drive ; tri ChevronUp/Down.
 - Badge « lecture » vidéo : disque noir 59 % + triangle blanc (`play_badge`).
 - « Live » : fond `live_bg` (ou `add_bg` pour un fichier créé) qui s'estompe en 8 s (`MARK_SECS`) +
   barre verticale de 3 px à gauche ; texte « modifié · 3 s ».
 
-### Composants réutilisables (dans `ui.rs` / `extras.rs`)
+### Composants réutilisables
 
-`paint_text_left` / `paint_text_right` / `trunc` (texte tronqué avec « … »), `blend` (fondu de couleur),
-`ago` (« 3 s », « 2 min »), `play_badge`, `sort_header` (en-tête cliquable ▲▼), `rename_box` (champ de
+Du socle (`socle::ui`) : `paint_text_left` / `paint_text_right` / `trunc` (texte tronqué avec « … »),
+`blend` (fondu de couleur), `ago` (« 3 s », « 2 min »), `segmented` (Bureau / Dev), `autocomplete_field`
+(barre d'adresse et filtre : historique + dossiers / noms du dossier, flou), `Palette` (Ctrl+K),
+`help_window` (F1). Propres à l'explorateur (`ui.rs` / `extras.rs`) : `play_badge`, `sort_header` (en-tête cliquable ▲▼), `rename_box` (champ de
 renommage qui présélectionne le nom sans extension), lignes dessinées au `painter` + `ui.interact`
 (rapide, pas de widgets par ligne), sélecteur segmenté (Bureau / Dev), fenêtres modales sur fond assombri
 (Ctrl+P, plein écran), toasts dans la barre d'état.
@@ -134,17 +140,19 @@ renommage qui présélectionne le nom sans extension), lignes dessinées au `pai
 ## 5. Conventions
 
 **Raccourcis** (liste complète avec F1 dans l'app) : Ctrl+T/W onglets, Ctrl+Tab, Ctrl+L chemin, Ctrl+F
-filtre, Ctrl+P aller à, Alt+←/→, Retour arrière (parent), Entrée ouvrir, F2 renommer (lot si plusieurs),
+filtre, **Ctrl+K palette de commandes**, Ctrl+P aller à (dossiers et fichiers), Alt+←/→, Retour arrière (parent), Entrée ouvrir, F2 renommer (lot si plusieurs),
 Suppr / Maj+Suppr, Ctrl+C/X/V, Ctrl+Maj+C chemin, Ctrl+Maj+N dossier, Ctrl+A, Ctrl+H cachés,
-Ctrl+Maj+L / G liste/grille, Ctrl+Maj+D Bureau/Dev, F3 double volet, F6 / Maj+F6 vers l'autre volet,
-Ctrl+Z annuler, Espace plein écran, F5, Maj+clic droit menu Windows, clic molette = nouvel onglet,
-lettres = aller au fichier. Ctrl+1/2 ne marche pas en AZERTY (les chiffres n'arrivent pas à egui) :
-on utilise des lettres.
+Ctrl+1/2 (et Ctrl+Maj+L / G) liste/grille, Ctrl+Maj+D Bureau/Dev, F3 double volet, F6 / Maj+F6 vers
+l'autre volet, Ctrl+Z annuler, Espace plein écran, F5, Maj+clic droit menu Windows, clic molette = nouvel
+onglet, lettres = aller au fichier. Ctrl+chiffre marche en AZERTY grâce à `socle::keys::consume_ctrl_digit`
+(touche physique).
 
 **Réglages** : `%APPDATA%\Explorateur\settings.json` (`Settings` sérialisé par serde, `#[serde(default)]`,
 écriture atomique via `.tmp` + renommage) : thème, mode, vue, onglets, épingles, visites (Ctrl+P), taille de
-fenêtre, options. Autres fichiers : `%APPDATA%\Explorateur\crash.log`, `%APPDATA%\Explorateur\inbox\`
-(instance unique), `%LOCALAPPDATA%\Explorateur\index.bin`.
+fenêtre, historiques d'autocomplétion (adresse, filtre), commandes récentes de Ctrl+K, options
+(`socle::settings`). Autres fichiers : `%APPDATA%\Explorateur\crash.log` (`socle::crash`),
+`%LOCALAPPDATA%\Explorateur\index.bin`, `%LOCALAPPDATA%\Explorateur\miniatures\` (cache QOI, 500 Mo max,
+ménage au lancement).
 
 **Style de code** : commentaires et textes d'UI en français ; modules courts par domaine ; état
 centralisé dans `App` ; actions différées ; pas d'`unwrap` sur les E/S (erreurs → toast rouge dans la barre
@@ -152,11 +160,11 @@ d'état) ; `unsafe` limité aux appels Win32 de `winx.rs`, `sizes.rs`, `index.rs
 Panique → `crash.log` avec pile d'appels, signalé au lancement suivant.
 
 **Lancement / installation / mise à jour** : exe portable (zip de release à décompresser), aucun
-installateur. `Explorateur.exe [dossier]`. Une 2ᵉ instance transmet le dossier à la première (mutex
-`Local\Explorateur.SingleInstance` + fichiers `.req` dans `inbox`). Mise à jour : vérification de
-`https://api.github.com/repos/Desarrh/explorateur/releases/latest` une fois par 24 h, asset
-`*windows-x64.zip`, l'exe en cours est renommé `.old`, le nouveau le remplace, relance avec
-`--after-update`. En dev : `scripts\maj.ps1`.
+installateur. `Explorateur.exe [dossier]`. Une 2ᵉ instance transmet le dossier à la première par
+`socle::instance` (mutex nommé + tube, < 1 ms, plus de sondage). Mise à jour (`socle::update`, constante
+`app::UPDATER`) : vérification de `https://api.github.com/repos/Desarrh/explorateur/releases/latest` une
+fois par 24 h, asset `*windows-x64.zip`, l'exe en cours est renommé `.old`, le nouveau le remplace, relance
+avec `--apres-maj` (la nouvelle instance attend 0,8 s que l'ancienne rende le mutex). En dev : `scripts\maj.ps1`.
 
 **Git** : auteur `Desarrh <175427122+Desarrh@users.noreply.github.com>`, pas de mention de Claude dans
 les commits. Dépôt public `Desarrh/explorateur`.
@@ -165,9 +173,12 @@ les commits. Dépôt public `Desarrh/explorateur`.
 
 - Onglets, historique, fil d'Ariane cliquable ou éditable, accès rapide, épingles, disques avec espace libre.
 - Liste triable (tri naturel) ou grille de miniatures ; aperçu (image, image de vidéo, texte/code, méta).
-- Miniatures Windows : vidéos, PDF, Office, PSD, HEIC, pochettes audio.
+- Miniatures de presque tous les formats d'image (socle, cache disque : 2ᵉ affichage instantané) ; sinon
+  miniatures Windows : vidéos, PDF, Office, PSD, pochettes audio.
 - Suivi live (surlignage 8 s, pas de rechargement, écritures atomiques sans clignotement).
-- Filtre flou, recherche récursive parallèle qui respecte `.gitignore`.
+- Filtre flou avec autocomplétion (historique + noms du dossier), recherche récursive parallèle qui
+  respecte `.gitignore` ; barre d'adresse avec autocomplétion (sous-dossiers + dossiers fréquents).
+- Palette de commandes Ctrl+K (toutes les actions, récentes en tête) ; aide F1 générée depuis la même liste.
 - Ctrl+P : dossiers fréquents/récents + index de tous les fichiers des disques (~2 M noms, ~5 ms).
 - Taille des dossiers en arrière-plan (parallèle, cache).
 - Double volet, renommage en lot (motifs, regex, aperçu des conflits).
@@ -197,8 +208,7 @@ les commits. Dépôt public `Desarrh/explorateur`.
   « Convertir en MP3 » via le lecteur.
 - **Vigie** (possible) : réutiliser le suivi `notify` et le flux d'activité ; ouvrir l'explorateur sur un
   fichier signalé (`ShowInFolder`).
-- **Thème partagé** : `theme.rs` est autonome (palette + `apply` + polices) et peut être copié tel quel
-  ou extrait dans une petite crate commune aux 5 apps.
+- **Socle** (existante) : thème, icônes, composants et services communs aux apps (voir § 2).
 
 ## 8. Limites connues / dette technique
 
@@ -206,7 +216,9 @@ les commits. Dépôt public `Desarrh/explorateur`.
 - Index global non live (reconstruit au lancement puis toutes les 20 min) ; ~160 Mo de RAM juste après le
   premier scan (désactivable). Pendant un rescan, l'ancien et le nouvel index coexistent.
 - Moteur de rendu CPU issu d'une petite crate tierce (`hdrshot-egui-backend`) : risque de bugs d'affichage.
-- Ctrl+1/2 inutilisables en AZERTY ; Maj+clic pour étendre une sélection pas vérifié à la souris.
+- Maj+clic pour étendre une sélection pas vérifié à la souris.
+- `drag` (glisser vers l'extérieur) tire encore d'anciennes versions de `windows` (0.52 / 0.58-core) en plus
+  de la 0.62 : un peu de taille d'exe en double.
 - Fonctions pas encore vérifiées à l'écran : Ctrl+P global, F6, zip depuis l'UI, sous-menus du menu natif,
   Claude Code dans l'app, explorateur par défaut, installation d'une mise à jour réelle.
 - Pas de lecture vidéo intégrée ; pas de miniatures sans le codec Windows correspondant.
