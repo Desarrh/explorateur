@@ -31,6 +31,8 @@ pub struct Settings {
     pub dark: bool,
     pub dev: bool,
     pub grid: bool,
+    /// Vue « Carte de l'espace » (E3) à la place de la liste / grille.
+    pub space_map: bool,
     pub preview: bool,
     pub show_hidden: bool,
     pub pinned: Vec<PathBuf>,
@@ -65,6 +67,7 @@ impl Default for Settings {
             dark: false,
             dev: false,
             grid: false,
+            space_map: false,
             preview: true,
             show_hidden: false,
             pinned: vec![],
@@ -321,6 +324,8 @@ pub enum Action {
     Back,
     Forward,
     ShowInFolder(PathBuf),
+    /// Corbeille pour des chemins précis (carte de l'espace).
+    TrashPaths(Vec<PathBuf>),
     SelectAll,
     GitSelect(String),
     GitRestoreAsk(String, bool),
@@ -458,6 +463,8 @@ pub struct App {
     pub index: Option<crate::index::Index>,
     /// Récents partout (E2) : surveillance en direct des disques fixes.
     pub recents_live: Option<crate::recents::Live>,
+    /// Carte de l'espace de chaque onglet (par id d'onglet).
+    pub space_maps: HashMap<u64, crate::spacemap::MapState>,
     recents_seen: u64,
     recents_loaded_at: Instant,
     /// Mise à jour disponible (bandeau dans la barre d'état).
@@ -608,6 +615,7 @@ impl App {
             preview_fallback_rx: pfrx,
             index: None,
             recents_live: None,
+            space_maps: HashMap::new(),
             recents_seen: 0,
             recents_loaded_at: Instant::now(),
             update: None,
@@ -1479,8 +1487,8 @@ impl App {
             self.drives = fsx::drives();
             self.drives_at = Instant::now();
         }
-        // Taille des dossiers du dossier affiché (en arrière-plan)
-        if self.s.folder_sizes {
+        // Taille des dossiers du dossier affiché (en arrière-plan) ; la carte de l'espace en a besoin aussi.
+        if self.s.folder_sizes || (self.s.space_map && !self.s.dev) {
             if self.sizes.poll() && self.s.sort == Sort::Size {
                 for t in &mut self.tabs {
                     t.view_dirty = true;
@@ -1548,8 +1556,9 @@ impl App {
         // Ctrl+1 / Ctrl+2 : liste / grille, par la touche physique (marche aussi en AZERTY).
         if !ctx.egui_wants_keyboard_input() {
             match socle::keys::consume_ctrl_digit(&ctx) {
-                Some(1) => self.s.grid = false,
-                Some(2) => self.s.grid = true,
+                Some(1) => (self.s.grid, self.s.space_map) = (false, false),
+                Some(2) => (self.s.grid, self.s.space_map) = (true, false),
+                Some(3) => self.s.space_map = true,
                 _ => {}
             }
         }
@@ -1644,10 +1653,13 @@ impl App {
             }
             // Liste / grille : Ctrl+Maj+L / Ctrl+Maj+G (tous claviers), Ctrl+1 / Ctrl+2 (QWERTY).
             if i.consume_key(M::COMMAND | M::SHIFT, Key::L) {
-                self.s.grid = false;
+                (self.s.grid, self.s.space_map) = (false, false);
             }
             if i.consume_key(M::COMMAND | M::SHIFT, Key::G) {
-                self.s.grid = true;
+                (self.s.grid, self.s.space_map) = (true, false);
+            }
+            if i.consume_key(M::COMMAND | M::SHIFT, Key::M) {
+                self.s.space_map = true;
             }
             if i.consume_key(M::COMMAND, Key::L) {
                 let p = self.tabs[self.active].path.to_string_lossy().into_owned();
@@ -1817,6 +1829,9 @@ impl App {
             }
             Action::CloseTab(i) => {
                 let i = if i == usize::MAX { self.active } else { i };
+                if let Some(t) = self.tabs.get(i) {
+                    self.space_maps.remove(&t.id);
+                }
                 if self.tabs.len() > 1 && i < self.tabs.len() {
                     let t = self.tabs.remove(i);
                     if let Some(s) = t.search {
@@ -1933,6 +1948,11 @@ impl App {
                     } else {
                         self.ops.submit(Op::Copy { srcs: files, dst });
                     }
+                }
+            }
+            Action::TrashPaths(paths) => {
+                if !paths.is_empty() {
+                    self.ops.submit(Op::Trash(paths));
                 }
             }
             Action::Trash => {

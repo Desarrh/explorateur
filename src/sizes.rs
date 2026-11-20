@@ -23,6 +23,8 @@ pub struct Sizes {
     current: Arc<AtomicU64>,
     pub map: HashMap<PathBuf, u64>,
     pending: HashSet<PathBuf>,
+    /// Change à chaque arrivée ou invalidation de tailles (la carte de l'espace se relit).
+    pub version: u64,
 }
 
 impl Sizes {
@@ -56,7 +58,7 @@ impl Sizes {
                 });
             }
         });
-        Sizes { tx, rx, current, map: HashMap::new(), pending: HashSet::new() }
+        Sizes { tx, rx, current, map: HashMap::new(), pending: HashSet::new(), version: 0 }
     }
 
     /// Calcule les dossiers donnés (ceux du dossier affiché), en abandonnant les anciens.
@@ -84,7 +86,15 @@ impl Sizes {
         if self.map.len() > MAX_CACHE {
             self.map.clear();
         }
+        if any {
+            self.version += 1;
+        }
         any
+    }
+
+    /// Dossiers dont la taille est en cours de calcul.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
     }
 
     pub fn is_pending(&self, p: &Path) -> bool {
@@ -101,7 +111,11 @@ impl Sizes {
             a = p.parent();
         }
         self.map.remove(changed);
-        self.map.len() != before
+        let changed = self.map.len() != before;
+        if changed {
+            self.version += 1;
+        }
+        changed
     }
 }
 

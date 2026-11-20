@@ -11,6 +11,7 @@ mod index;
 mod ops;
 mod recents;
 mod sizes;
+mod spacemap;
 #[cfg(test)]
 mod tests;
 mod thumbs;

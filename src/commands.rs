@@ -43,6 +43,7 @@ impl App {
             // Vue
             c("liste", "Afficher en liste", "Vue", "Ctrl+1", Icon::ListView),
             c("grille", "Afficher en grille (miniatures)", "Vue", "Ctrl+2", Icon::Grid),
+            c("carte", "Carte de l’espace disque (ce qui prend de la place)", "Vue", "Ctrl+3", Icon::Chart),
             c("double-volet", "Double volet", "Vue", "F3", Icon::Panel),
             c("apercu", "Aperçu plein écran", "Vue", "Espace", Icon::Eye),
             c("volet-apercu", "Volet d’aperçu", "Vue", "", Icon::Panel),
@@ -109,11 +110,15 @@ impl App {
             "fermer-onglet" => Action::CloseTab(usize::MAX),
             "onglet-suivant" => Action::ActivateTab((self.active + 1) % self.tabs.len()),
             "liste" => {
-                self.s.grid = false;
+                (self.s.grid, self.s.space_map) = (false, false);
                 return;
             }
             "grille" => {
-                self.s.grid = true;
+                (self.s.grid, self.s.space_map) = (true, false);
+                return;
+            }
+            "carte" => {
+                self.s.space_map = true;
                 return;
             }
             "double-volet" => Action::ToggleSplit,

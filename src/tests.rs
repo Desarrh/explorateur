@@ -362,6 +362,7 @@ fn git_t(dir: &std::path::Path, args: &[&str]) -> String {
         .args(args)
         .output()
         .expect("git");
+    assert!(o.status.success(), "git {args:?} : {}", String::from_utf8_lossy(&o.stderr));
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
@@ -635,5 +636,102 @@ fn capture_recents() {
         },
         |app| app.tab().view.len() >= 6,
     );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn carte_disposition_en_carres() {
+    use crate::spacemap::squarify;
+    let area = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(800.0, 500.0));
+    let vals = [500.0, 250.0, 120.0, 60.0, 40.0, 20.0, 6.0, 3.0, 1.0];
+    let rs = squarify(&vals, area);
+    let total: f64 = vals.iter().sum();
+    let a_tot = (area.width() * area.height()) as f64;
+    for (v, r) in vals.iter().zip(&rs) {
+        // aire proportionnelle (à 1 % près) et dans la zone
+        let a = (r.width() * r.height()) as f64;
+        assert!((a - v / total * a_tot).abs() < a_tot * 0.01, "{v} → {r:?}");
+        assert!(area.expand(0.01).contains_rect(*r), "{r:?} hors de {area:?}");
+    }
+    for i in 0..rs.len() {
+        for j in i + 1..rs.len() {
+            let inter = rs[i].intersect(rs[j]);
+            assert!(inter.width() <= 0.01 || inter.height() <= 0.01, "chevauchement {i}/{j}");
+        }
+    }
+    // « en carrés » : le plus gros rectangle n'est pas une bande fine
+    let r0 = rs[0];
+    assert!(r0.width().max(r0.height()) / r0.width().min(r0.height()) < 3.0, "{r0:?}");
+}
+
+#[test]
+fn carte_arbre_et_regroupement() {
+    let d = tmpdir("carte");
+    std::fs::create_dir_all(d.join("Jeux").join("Gros")).unwrap();
+    std::fs::write(d.join("Jeux").join("Gros").join("data.pak"), vec![0u8; 400_000]).unwrap();
+    std::fs::write(d.join("Jeux").join("lanceur.exe"), vec![0u8; 50_000]).unwrap();
+    std::fs::write(d.join("film.mkv"), vec![0u8; 300_000]).unwrap();
+    for i in 0..30 {
+        std::fs::write(d.join(format!("miette{i}.txt")), b"x").unwrap();
+    }
+    let mut sizes = std::collections::HashMap::new();
+    sizes.insert(d.join("Jeux"), 450_000u64);
+    sizes.insert(d.join("Jeux").join("Gros"), 400_000u64);
+    let t = crate::spacemap::build(&d, &sizes);
+    assert_eq!(t.size, 450_000 + 300_000 + 30);
+    let names: Vec<&str> = t.children.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names[..2], ["Jeux", "film.mkv"], "du plus gros au plus petit");
+    assert_eq!(t.children.last().unwrap().rest, Some(30), "les miettes sont regroupées : {names:?}");
+    let jeux = &t.children[0];
+    assert_eq!(jeux.children[0].name, "Gros", "un niveau de plus pour les gros dossiers");
+    assert_eq!(jeux.children[0].children[0].name, "data.pak");
+    let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+    let tiles = crate::spacemap::layout(&t, area);
+    assert!(tiles.iter().any(|x| x.name == "data.pak" && x.depth == 2), "contenu imbriqué dessiné");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Capture de la carte de l'espace (E3), sans fenêtre.
+/// `CAPTURE_DIR=<dossier> cargo test --release capture_carte -- --ignored`
+#[test]
+#[ignore]
+fn capture_carte() {
+    let outdir = PathBuf::from(std::env::var("CAPTURE_DIR").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned()));
+    let d = tmpdir("capture-carte");
+    let files: [(&str, usize); 14] = [
+        ("SteamLibrary/Jeu A/data/textures.pak", 9_000_000),
+        ("SteamLibrary/Jeu A/data/audio.pak", 3_500_000),
+        ("SteamLibrary/Jeu A/jeu.exe", 900_000),
+        ("SteamLibrary/Jeu B/contenu.pak", 6_000_000),
+        ("SteamLibrary/Jeu B/films/intro.mp4", 2_500_000),
+        ("Vidéos/rush 01.mp4", 5_000_000),
+        ("Vidéos/rush 02.mp4", 3_200_000),
+        ("Vidéos/export.mp4", 1_400_000),
+        ("Musique/album.flac", 1_800_000),
+        ("Images/photo 1.png", 700_000),
+        ("Images/photo 2.jpg", 500_000),
+        ("Archives/sauvegarde.zip", 2_200_000),
+        ("notes.txt", 20_000),
+        ("installeur.msi", 1_100_000),
+    ];
+    for (rel, n) in files {
+        let p = d.join(rel.replace('/', "\\"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, vec![0u8; n]).unwrap();
+    }
+    for dark in [false, true] {
+        let s = crate::app::Settings { tabs: vec![d.clone()], space_map: true, dark, preview: false, global_index: false, auto_update: false, ..Default::default() };
+        capture_png(
+            &outdir.join(format!("carte-{}.png", if dark { "sombre" } else { "clair" })),
+            s,
+            1400,
+            820,
+            |_, _| {},
+            |app| {
+                app.sizes.pending_count() == 0
+                    && app.space_maps.values().any(|m| m.tree.as_ref().map(|t| t.size > 30_000_000).unwrap_or(false))
+            },
+        );
+    }
     let _ = std::fs::remove_dir_all(&d);
 }

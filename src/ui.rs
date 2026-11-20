@@ -209,13 +209,17 @@ impl App {
                         }
                         if !self.s.dev {
                             ui.add_space(4.0);
-                            let grid = self.s.grid;
+                            let (grid, map) = (self.s.grid && !self.s.space_map, self.s.space_map);
                             let look = |on: bool| if on { Look::active(&p) } else { Look::tool(&p) };
-                            if icons::button(ui, Icon::Grid, 32.0, look(grid), "Grille / miniatures (Ctrl+2)").clicked() {
-                                self.s.grid = true;
+                            // (de droite à gauche : Liste | Grille | Carte)
+                            if icons::button(ui, Icon::Chart, 32.0, look(map), "Carte de l’espace disque (Ctrl+3)").clicked() {
+                                self.s.space_map = true;
                             }
-                            if icons::button(ui, Icon::ListView, 32.0, look(!grid), "Liste détaillée (Ctrl+1)").clicked() {
-                                self.s.grid = false;
+                            if icons::button(ui, Icon::Grid, 32.0, look(grid), "Grille / miniatures (Ctrl+2)").clicked() {
+                                (self.s.grid, self.s.space_map) = (true, false);
+                            }
+                            if icons::button(ui, Icon::ListView, 32.0, look(!grid && !map), "Liste détaillée (Ctrl+1)").clicked() {
+                                (self.s.grid, self.s.space_map) = (false, false);
                             }
                         }
                         ui.add_space(4.0);
@@ -696,6 +700,11 @@ impl App {
                 ui.label(RichText::new("Impossible d’ouvrir ce dossier").size(16.0).strong());
                 ui.label(RichText::new(e).color(p.muted));
             });
+            return;
+        }
+        // Carte de l'espace : le dossier entier, sans filtre (pas pour l'onglet « Récents »).
+        if self.s.space_map && !crate::recents::is_recents(&t.path) && t.filter.is_empty() {
+            self.draw_space_map(ui);
             return;
         }
         if t.view.is_empty() {
