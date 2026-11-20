@@ -1294,9 +1294,6 @@ impl App {
                     match root {
                         Some(root) => {
                             if self.repo.as_ref().map(|r| r.root != root).unwrap_or(true) {
-                                if let Some(q) = self.bursts.watch_repo(&root) {
-                                    self.git.send(git::Req::Snapshot { root: q.root, base: q.base, files: q.files, why: 0 });
-                                }
                                 self.repo = Some(Repo::new(root.clone()));
                                 self.git.send(git::Req::Status(root));
                             }
@@ -1483,6 +1480,15 @@ impl App {
     }
 
     fn tick_bursts(&mut self) {
+        // Instantané de base seulement en vue Dev (les passes n'y sont enregistrées que là) :
+        // ouvrir un dépôt en vue Bureau n'écrit rien dans son .git.
+        if self.s.dev {
+            if let Some(root) = self.repo.as_ref().map(|r| r.root.clone()) {
+                if let Some(q) = self.bursts.watch_repo(&root) {
+                    self.git.send(git::Req::Snapshot { root: q.root, base: q.base, files: q.files, why: 0 });
+                }
+            }
+        }
         for q in self.bursts.tick() {
             let why = match q.why {
                 crate::bursts::SnapWhy::Close(id) => id,
