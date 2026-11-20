@@ -30,26 +30,7 @@ pub fn is_recents(p: &Path) -> bool {
 
 /// Dossier (nom en minuscules) dont le contenu change sans que l'utilisateur y soit pour rien.
 pub fn noisy_dir(low: &str) -> bool {
-    low.starts_with('.')
-        || low.starts_with('$')
-        || matches!(
-            low,
-            "appdata"
-                | "programdata"
-                | "program files"
-                | "program files (x86)"
-                | "windows"
-                | "system volume information"
-                | "steamapps"
-                | "temp"
-                | "tmp"
-                | "node_modules"
-                | "target"
-                | "__pycache__"
-                | "obj"
-                | "intermediate"
-                | "deriveddatacache"
-        )
+    crate::fsx::is_noisy_dir(low)
 }
 
 /// Fichier (nom en minuscules) technique ou temporaire.

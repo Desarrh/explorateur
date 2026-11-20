@@ -332,13 +332,13 @@ pub mod default_explorer {
 }
 
 /// Le vrai menu clic droit de Windows (7-Zip, Git, « Envoyer vers », extensions…).
-/// Objet de données du Shell pour ces fichiers (CF_HDROP, noms, PIDL…), exactement celui que
-/// l'Explorateur fournit quand on glisse des fichiers. Accepte des fichiers de dossiers différents.
+/// Chemins → tableau d'éléments du Shell (les PIDL intermédiaires sont libérés ici : le tableau
+/// garde ses propres copies). Utilisé par le menu natif et le glisser vers l'extérieur.
 #[cfg(windows)]
-pub fn shell_data_object(paths: &[PathBuf]) -> Result<windows::Win32::System::Com::IDataObject, String> {
+fn shell_items(paths: &[PathBuf]) -> windows::core::Result<windows::Win32::UI::Shell::IShellItemArray> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-    use windows::Win32::UI::Shell::{BHID_DataObject, ILFree, SHCreateShellItemArrayFromIDLists, SHParseDisplayName};
+    use windows::Win32::UI::Shell::{ILFree, SHCreateShellItemArrayFromIDLists, SHParseDisplayName};
     use windows::core::PCWSTR;
     unsafe {
         let mut pidls: Vec<*mut ITEMIDLIST> = Vec::new();
@@ -349,19 +349,25 @@ pub fn shell_data_object(paths: &[PathBuf]) -> Result<windows::Win32::System::Co
                 pidls.push(pidl);
             }
         }
-        let res = (|| {
-            if pidls.is_empty() {
-                return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG));
-            }
+        let res = if pidls.is_empty() {
+            Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG))
+        } else {
             let consts: Vec<*const ITEMIDLIST> = pidls.iter().map(|p| *p as *const _).collect();
-            let arr = SHCreateShellItemArrayFromIDLists(&consts)?;
-            arr.BindToHandler(None, &BHID_DataObject)
-        })();
+            SHCreateShellItemArrayFromIDLists(&consts)
+        };
         for p in pidls {
-            ILFree(Some(p));
+            ILFree(Some(p as *const _));
         }
-        res.map_err(|e| e.message())
+        res
     }
+}
+
+/// Objet de données du Shell pour ces fichiers (CF_HDROP, noms, PIDL…), exactement celui que
+/// l'Explorateur fournit quand on glisse des fichiers. Accepte des fichiers de dossiers différents.
+#[cfg(windows)]
+pub fn shell_data_object(paths: &[PathBuf]) -> Result<windows::Win32::System::Com::IDataObject, String> {
+    use windows::Win32::UI::Shell::BHID_DataObject;
+    unsafe { shell_items(paths).and_then(|arr| arr.BindToHandler(None, &BHID_DataObject)).map_err(|e| e.message()) }
 }
 
 /// Glisser des fichiers hors de la fenêtre (Bureau, Discord, navigateur…) : glisser-déposer OLE du
@@ -383,34 +389,27 @@ pub fn drag_files(hwnd: isize, paths: &[PathBuf]) -> Result<(), String> {
 /// Bloquant tant que le menu est ouvert, comme dans l'Explorateur.
 #[cfg(windows)]
 pub fn native_context_menu(hwnd: isize, paths: &[std::path::PathBuf]) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::{HWND, POINT};
-    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-    use windows::Win32::UI::Shell::{
-        BHID_SFUIObject, CMF_NORMAL, CMINVOKECOMMANDINFO, IContextMenu, ILFree, SHCreateShellItemArrayFromIDLists,
-        SHParseDisplayName,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CreatePopupMenu, DestroyMenu, GetCursorPos, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
-    };
-    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::{BHID_SFUIObject, CMF_NORMAL, CMINVOKECOMMANDINFO, IContextMenu};
+    use windows::Win32::UI::WindowsAndMessaging::{CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx};
     if paths.is_empty() {
         return Ok(());
     }
-    unsafe {
-        let mut pidls: Vec<*mut ITEMIDLIST> = Vec::new();
-        for p in paths {
-            let w: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-            let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
-            if SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut pidl, 0, None).is_ok() && !pidl.is_null() {
-                pidls.push(pidl);
+    /// Détruit le menu dans tous les cas, y compris sur un chemin d'erreur.
+    struct MenuGuard(HMENU);
+    impl Drop for MenuGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyMenu(self.0);
             }
         }
+    }
+    unsafe {
         let result = (|| -> windows::core::Result<()> {
-            let consts: Vec<*const ITEMIDLIST> = pidls.iter().map(|p| *p as *const _).collect();
-            let arr = SHCreateShellItemArrayFromIDLists(&consts)?;
+            let arr = shell_items(paths)?;
             let cm: IContextMenu = arr.BindToHandler(None, &BHID_SFUIObject)?;
-            let menu = CreatePopupMenu()?;
+            let guard = MenuGuard(CreatePopupMenu()?);
+            let menu = guard.0;
             cm.QueryContextMenu(menu, 0, 1, 0x7FFF, CMF_NORMAL).ok()?;
             let mut pt = POINT::default();
             GetCursorPos(&mut pt)?;
@@ -439,12 +438,8 @@ pub fn native_context_menu(hwnd: isize, paths: &[std::path::PathBuf]) -> Result<
                 };
                 let _ = cm.InvokeCommand(&info);
             }
-            let _ = DestroyMenu(menu);
             Ok(())
         })();
-        for p in pidls {
-            ILFree(Some(p as *const _));
-        }
         result.map_err(|e| e.message().to_string())
     }
 }
@@ -542,7 +537,25 @@ pub fn open_with(path: &Path) {
 }
 
 pub fn reveal_in_explorer(path: &Path) {
-    let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{}", path.display())).spawn();
+    // L'API du Shell plutôt que « explorer /select,<chemin> », qui casse si le chemin contient
+    // une virgule.
+    #[cfg(windows)]
+    unsafe {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+        use windows::Win32::UI::Shell::{ILFree, SHOpenFolderAndSelectItems, SHParseDisplayName};
+        use windows::core::PCWSTR;
+        let w: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        if SHParseDisplayName(PCWSTR(w.as_ptr()), None, &mut pidl, 0, None).is_ok() && !pidl.is_null() {
+            let ok = SHOpenFolderAndSelectItems(pidl, None, 0).is_ok();
+            ILFree(Some(pidl as *const _));
+            if ok {
+                return;
+            }
+        }
+    }
+    let _ = std::process::Command::new("explorer.exe").arg(format!("/select,\"{}\"", path.display())).spawn();
 }
 
 pub fn open_terminal(dir: &Path) {

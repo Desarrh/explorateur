@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 pub const MARK_SECS: f32 = 8.0;
-const NOISY: [&str; 8] = ["target", "node_modules", ".godot", ".import", "__pycache__", ".next", ".turbo", ".cache"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum Sort {
@@ -1091,7 +1090,7 @@ impl App {
                     continue;
                 }
             }
-            let noisy = comps.iter().any(|c| NOISY.contains(&c.as_str()));
+            let noisy = comps.iter().any(|c| fsx::is_build_dir(c));
             if noisy && !in_tab {
                 continue;
             }
@@ -1494,7 +1493,7 @@ impl App {
                 .threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(12))
                 .filter_entry(|e| {
                     let n = e.file_name().to_string_lossy().to_lowercase();
-                    !(e.depth() > 0 && e.file_type().map(|t| t.is_dir()).unwrap_or(false) && (n == ".git" || NOISY.contains(&n.as_str())))
+                    !(e.depth() > 0 && e.file_type().map(|t| t.is_dir()).unwrap_or(false) && (n == ".git" || fsx::is_build_dir(&n)))
                 })
                 .build_parallel();
             let collector = {

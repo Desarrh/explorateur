@@ -237,3 +237,98 @@ pub fn read_text_preview(path: &Path, max: usize) -> Option<String> {
     }
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
+
+// ---------------------------------------------------------------------------------------------
+// Dossiers « bruyants » : la seule liste de l'app (noms en minuscules).
+// ---------------------------------------------------------------------------------------------
+
+/// Dossiers de build et de cache : leurs changements n'intéressent personne (flux d'activité,
+/// recherche récursive, récents) et on ne les indexe pas.
+pub fn is_build_dir(low: &str) -> bool {
+    matches!(
+        low,
+        "target" | "node_modules" | "__pycache__" | ".godot" | ".import" | ".next" | ".turbo" | ".cache" | "obj" | "intermediate"
+            | "deriveddatacache"
+    )
+}
+
+/// Dossiers système, corbeilles, dépôts git : jamais indexés.
+pub fn is_system_dir(low: &str) -> bool {
+    matches!(low, "$recycle.bin" | "system volume information" | "windows" | "winsxs" | "$windows.~bt" | "$winreagent" | ".git")
+}
+
+/// Zones où les fichiers changent sans l'utilisateur (AppData, Program Files, dossiers cachés,
+/// temporaires, builds) : exclues des récents, moins bien classées dans la recherche.
+pub fn is_noisy_dir(low: &str) -> bool {
+    low.starts_with('.')
+        || low.starts_with('$')
+        || is_build_dir(low)
+        || is_system_dir(low)
+        || matches!(low, "appdata" | "programdata" | "program files" | "program files (x86)" | "steamapps" | "temp" | "tmp")
+}
+
+// ---------------------------------------------------------------------------------------------
+// Lecture rapide d'un dossier (la seule boucle FindFirstFileExW de l'app).
+// ---------------------------------------------------------------------------------------------
+
+/// Une entrée telle que la renvoie `FindFirstFileExW`, sans allocation.
+pub struct Found<'a> {
+    /// Nom en UTF-16 (sans le zéro final).
+    pub name: &'a [u16],
+    pub is_dir: bool,
+    /// Lien symbolique ou jonction vers un dossier (« name surrogate ») : à ne pas suivre.
+    /// Les dossiers OneDrive / cloud sont aussi des points d'analyse, mais pas des liens.
+    pub is_link: bool,
+    pub size: u64,
+    /// Dernière écriture (FILETIME : 100 ns depuis 1601).
+    pub write_time: u64,
+}
+
+/// Parcourt `dir` par gros blocs (FIND_FIRST_EX_LARGE_FETCH, FindExInfoBasic : taille, date et
+/// attributs viennent avec l'énumération, sans appel en plus). Gère les chemins longs et UNC.
+#[cfg(windows)]
+pub fn for_each_entry(dir: &Path, mut f: impl FnMut(&Found)) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FIND_FIRST_EX_LARGE_FETCH, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FindClose, FindExInfoBasic, FindExSearchNameMatch,
+        FindFirstFileExW, FindNextFileW, WIN32_FIND_DATAW,
+    };
+    // Préfixe \\?\ : chemins de plus de 260 caractères.
+    let s = dir.as_os_str().to_string_lossy();
+    let pattern = if s.starts_with(r"\\?\") {
+        format!(r"{}\*", s.trim_end_matches('\\'))
+    } else if let Some(unc) = s.strip_prefix(r"\\") {
+        format!(r"\\?\UNC\{}\*", unc.trim_end_matches('\\'))
+    } else {
+        format!(r"\\?\{}\*", s.trim_end_matches('\\'))
+    };
+    let wide: Vec<u16> = std::ffi::OsStr::new(&pattern).encode_wide().chain(std::iter::once(0)).collect();
+    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    let h = unsafe {
+        FindFirstFileExW(wide.as_ptr(), FindExInfoBasic, &mut data as *mut _ as *mut _, FindExSearchNameMatch, std::ptr::null(), FIND_FIRST_EX_LARGE_FETCH)
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return;
+    }
+    loop {
+        let n = data.cFileName.iter().position(|&c| c == 0).unwrap_or(data.cFileName.len());
+        let name = &data.cFileName[..n];
+        let dot = name == [b'.' as u16] || name == [b'.' as u16, b'.' as u16];
+        if !dot {
+            let attr = data.dwFileAttributes;
+            let is_dir = attr & FILE_ATTRIBUTE_DIRECTORY != 0;
+            f(&Found {
+                name,
+                is_dir,
+                is_link: is_dir && attr & FILE_ATTRIBUTE_REPARSE_POINT != 0 && data.dwReserved0 & 0x2000_0000 != 0,
+                size: ((data.nFileSizeHigh as u64) << 32) | data.nFileSizeLow as u64,
+                write_time: ((data.ftLastWriteTime.dwHighDateTime as u64) << 32) | data.ftLastWriteTime.dwLowDateTime as u64,
+            });
+        }
+        if unsafe { FindNextFileW(h, &mut data) } == 0 {
+            break;
+        }
+    }
+    unsafe { FindClose(h) };
+}

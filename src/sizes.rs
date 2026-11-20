@@ -150,53 +150,15 @@ fn walk(dir: &Path, depth: usize, g: u64, cur: &AtomicU64, found: &Mutex<Vec<(Pa
 /// Somme des fichiers d'un dossier + liste de ses sous-dossiers (sans suivre liens ni jonctions).
 #[cfg(windows)]
 fn list(dir: &Path) -> (u64, Vec<PathBuf>) {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FIND_FIRST_EX_LARGE_FETCH, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FindClose, FindExInfoBasic,
-        FindExSearchNameMatch, FindFirstFileExW, FindNextFileW, WIN32_FIND_DATAW,
-    };
-    // Préfixe \\?\ : chemins de plus de 260 caractères.
-    let s = dir.as_os_str().to_string_lossy();
-    let pattern = if s.starts_with(r"\\?\") {
-        format!(r"{}\*", s.trim_end_matches('\\'))
-    } else if let Some(unc) = s.strip_prefix(r"\\") {
-        format!(r"\\?\UNC\{}\*", unc.trim_end_matches('\\'))
-    } else {
-        format!(r"\\?\{}\*", s.trim_end_matches('\\'))
-    };
-    let wide: Vec<u16> = std::ffi::OsStr::new(&pattern).encode_wide().chain(std::iter::once(0)).collect();
-    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
-    let h = unsafe {
-        FindFirstFileExW(wide.as_ptr(), FindExInfoBasic, &mut data as *mut _ as *mut _, FindExSearchNameMatch, std::ptr::null(), FIND_FIRST_EX_LARGE_FETCH)
-    };
-    let mut files = 0u64;
-    let mut dirs = Vec::new();
-    if h == INVALID_HANDLE_VALUE {
-        return (0, dirs);
-    }
-    loop {
-        let name_len = data.cFileName.iter().position(|&c| c == 0).unwrap_or(data.cFileName.len());
-        let name = &data.cFileName[..name_len];
-        let dot = name == [b'.' as u16] || name == [b'.' as u16, b'.' as u16];
-        if !dot {
-            let attr = data.dwFileAttributes;
-            if attr & FILE_ATTRIBUTE_DIRECTORY != 0 {
-                // On ne suit pas les liens symboliques ni les jonctions (« name surrogate »),
-                // mais on entre dans les dossiers OneDrive / cloud, qui sont aussi des points d'analyse.
-                let surrogate = attr & FILE_ATTRIBUTE_REPARSE_POINT != 0 && data.dwReserved0 & 0x2000_0000 != 0;
-                if !surrogate {
-                    dirs.push(dir.join(std::ffi::OsString::from_wide(name)));
-                }
-            } else {
-                files += ((data.nFileSizeHigh as u64) << 32) | data.nFileSizeLow as u64;
-            }
+    use std::os::windows::ffi::OsStringExt;
+    let (mut files, mut dirs) = (0u64, Vec::new());
+    crate::fsx::for_each_entry(dir, |e| {
+        if !e.is_dir {
+            files += e.size;
+        } else if !e.is_link {
+            dirs.push(dir.join(std::ffi::OsString::from_wide(e.name)));
         }
-        if unsafe { FindNextFileW(h, &mut data) } == 0 {
-            break;
-        }
-    }
-    unsafe { FindClose(h) };
+    });
     (files, dirs)
 }
 

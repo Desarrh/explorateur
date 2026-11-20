@@ -18,11 +18,6 @@ const RESCAN: Duration = Duration::from_secs(6 * 3600);
 /// L'index n'est réécrit sur le disque que si la liste des noms a changé, ou au plus une fois par
 /// jour pour rafraîchir les dates.
 const REWRITE_DATES: Duration = Duration::from_secs(24 * 3600);
-/// Dossiers qu'on n'indexe pas : système, corbeilles, et dossiers « bruyants » de build.
-const SKIP_DIRS: [&str; 11] = [
-    "$recycle.bin", "system volume information", "windows", "node_modules", "target", ".git", "__pycache__", ".cache",
-    "winsxs", "$windows.~bt", "$winreagent",
-];
 
 #[derive(Clone, Copy)]
 struct Node {
@@ -184,18 +179,14 @@ impl Data {
         cands.truncate(600);
         for (score, i) in cands.iter_mut() {
             let mut depth = 0;
-            let mut hidden_area = false;
             let mut j = self.nodes[*i as usize].parent;
             while j != NONE {
                 depth += 1;
-                let n = self.name(j);
-                if n == "appdata" || n == "programdata" || n.starts_with('.') || n == "steamapps" {
-                    hidden_area = true;
-                }
                 j = self.nodes[j as usize].parent;
             }
             *score -= depth * 8;
-            if hidden_area {
+            // Zone bruyante (AppData, Program Files, dossiers cachés…) : calculée à l'indexation.
+            if self.nodes[*i as usize].flags & NOISY != 0 {
                 *score -= 600;
             }
         }
@@ -338,7 +329,8 @@ fn scan_all(hint_nodes: usize, hint_text: usize) -> Data {
         let mut stack: Vec<(PathBuf, u32)> = vec![(drive.root.clone(), root)];
         while let Some((dir, id)) = stack.pop() {
             for (name, is_dir, mtime) in list_names(&dir) {
-                if is_dir && SKIP_DIRS.contains(&name.to_lowercase().as_str()) {
+                // Système, corbeilles, git et builds : pas indexés (voir fsx::is_system_dir / is_build_dir).
+                if is_dir && { let low = name.to_lowercase(); crate::fsx::is_system_dir(&low) || crate::fsx::is_build_dir(&low) } {
                     continue;
                 }
                 let child = d.push(&name, is_dir, id, mtime);
@@ -380,43 +372,15 @@ fn is_fixed(_root: &Path) -> bool {
     true
 }
 
-/// Noms d'un dossier (sans suivre les liens/jonctions), lus par gros blocs.
+/// Noms d'un dossier (sans suivre les liens/jonctions), avec leur date en minutes.
 #[cfg(windows)]
 fn list_names(dir: &Path) -> Vec<(String, bool, u32)> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FIND_FIRST_EX_LARGE_FETCH, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FindClose, FindExInfoBasic,
-        FindExSearchNameMatch, FindFirstFileExW, FindNextFileW, WIN32_FIND_DATAW,
-    };
-    let s = dir.to_string_lossy();
-    let pattern = format!(r"\\?\{}\*", s.trim_end_matches('\\'));
-    let wide: Vec<u16> = std::ffi::OsStr::new(&pattern).encode_wide().chain(std::iter::once(0)).collect();
-    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
-    let h = unsafe {
-        FindFirstFileExW(wide.as_ptr(), FindExInfoBasic, &mut data as *mut _ as *mut _, FindExSearchNameMatch, std::ptr::null(), FIND_FIRST_EX_LARGE_FETCH)
-    };
     let mut out = Vec::new();
-    if h == INVALID_HANDLE_VALUE {
-        return out;
-    }
-    loop {
-        let n = data.cFileName.iter().position(|&c| c == 0).unwrap_or(data.cFileName.len());
-        let name = String::from_utf16_lossy(&data.cFileName[..n]);
-        if name != "." && name != ".." {
-            let attr = data.dwFileAttributes;
-            let is_dir = attr & FILE_ATTRIBUTE_DIRECTORY != 0;
-            let surrogate = attr & FILE_ATTRIBUTE_REPARSE_POINT != 0 && data.dwReserved0 & 0x2000_0000 != 0;
-            if !(is_dir && surrogate) {
-                let ft = ((data.ftLastWriteTime.dwHighDateTime as u64) << 32) | data.ftLastWriteTime.dwLowDateTime as u64;
-                out.push((name, is_dir, filetime_minutes(ft)));
-            }
+    crate::fsx::for_each_entry(dir, |e| {
+        if !e.is_link {
+            out.push((String::from_utf16_lossy(e.name), e.is_dir, filetime_minutes(e.write_time)));
         }
-        if unsafe { FindNextFileW(h, &mut data) } == 0 {
-            break;
-        }
-    }
-    unsafe { FindClose(h) };
+    });
     out
 }
 
