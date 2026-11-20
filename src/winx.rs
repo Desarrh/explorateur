@@ -136,6 +136,24 @@ pub use imp::*;
 // - le CLSID de Win+E → Win+E ouvre cette app.
 // Désactiver supprime exactement ces clés : l'Explorateur Windows reprend la main.
 #[cfg(windows)]
+/// Lancé depuis une app empaquetée (MSIX, p. ex. l'app Claude) ? Ses nouveaux fichiers d'AppData
+/// (et ses écritures dans HKCU) partent alors dans le conteneur de cette app, invisibles pour
+/// Windows et pour l'utilisateur. Ces processus n'ont pas d'identité de paquet : on le vérifie
+/// directement avec un fichier sonde (seulement quand on en a besoin, quelques ms).
+pub fn virtualized() -> bool {
+    let (Some(roaming), Some(local)) = (dirs::config_dir(), dirs::data_local_dir()) else { return false };
+    let name = format!("explorateur-sonde-{}.tmp", std::process::id());
+    let probe = roaming.join(&name);
+    if std::fs::write(&probe, b"").is_err() {
+        return false;
+    }
+    let found = std::fs::read_dir(local.join("Packages"))
+        .map(|rd| rd.flatten().any(|e| e.path().join("LocalCache").join("Roaming").join(&name).exists()))
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&probe);
+    found
+}
+
 pub mod default_explorer {
     use super::wide;
     use windows_sys::Win32::System::Registry::{

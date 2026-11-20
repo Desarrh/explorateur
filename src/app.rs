@@ -2292,6 +2292,12 @@ impl App {
 
     #[cfg(windows)]
     pub fn set_default_explorer(&mut self, on: bool) {
+        // Lancé depuis une app empaquetée : le registre écrit serait celui de son conteneur.
+        if winx::virtualized() {
+            self.toast("Explorateur a été lancé depuis une autre app (conteneur) : relance-le depuis le menu Démarrer pour changer ce réglage", true);
+            self.is_default = winx::default_explorer::is_enabled();
+            return;
+        }
         if on {
             match winx::default_explorer::enable() {
                 Ok(()) => self.toast("Explorateur est maintenant l’explorateur par défaut (Win+E, dossiers)", false),

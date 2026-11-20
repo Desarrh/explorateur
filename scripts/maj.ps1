@@ -3,7 +3,7 @@
 # - si l'exe est en cours d'utilisation, il est renommé en .old (Windows l'autorise) et le nouveau
 #   prend sa place : la fenêtre ouverte continue de tourner, la nouvelle version servira au prochain
 #   lancement (le .old est supprimé à ce moment-là) ;
-# - rien n'est fermé ni relancé, sauf avec -Relancer (à n'utiliser qu'avec l'accord de l'utilisateur).
+# - rien n'est fermé ni relancé, sauf avec -Relancer (autorisé pendant la session de dev, DIRECTION.md §0).
 # Usage : powershell -ExecutionPolicy Bypass -File scripts\maj.ps1 [-Relancer]
 param([switch]$Relancer)
 $ErrorActionPreference = 'Stop'
@@ -43,4 +43,6 @@ if ($running.Count -gt 0 -and -not $Relancer) {
 } else {
     Write-Host "Explorateur mis à jour : $dist" -ForegroundColor Green
 }
-if ($Relancer -and $running.Count -gt 0) { Start-Process $dist }
+# Relance via explorer.exe : lancé depuis l'app Claude (empaquetée MSIX), un Start-Process direct
+# ferait tourner l'explorateur dans son conteneur (réglages et registre virtualisés, invisibles).
+if ($Relancer -and $running.Count -gt 0) { Start-Process explorer.exe -ArgumentList ('"' + $dist + '"') }

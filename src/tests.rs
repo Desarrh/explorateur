@@ -736,3 +736,9 @@ fn capture_carte() {
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Affiche si le processus de test est dans un conteneur MSIX (diagnostic, toujours vert).
+#[test]
+fn diagnostic_conteneur() {
+    println!("écritures virtualisées (conteneur MSIX) : {}", crate::winx::virtualized());
+}
