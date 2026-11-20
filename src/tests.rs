@@ -518,3 +518,122 @@ fn capture_passes() {
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Fixe la date de modification d'un fichier (il y a `mins` minutes).
+fn set_age(p: &Path, mins: u64) {
+    let t = std::time::SystemTime::now() - std::time::Duration::from_secs(mins * 60);
+    std::fs::File::options().write(true).open(p).unwrap().set_modified(t).unwrap();
+}
+
+#[test]
+fn recents_index_dates_et_zones_bruyantes() {
+    let d = tmpdir("recents-index");
+    let w = |rel: &str, mins: u64| {
+        let p = d.join(rel.replace('/', "\\"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"x").unwrap();
+        set_age(&p, mins);
+    };
+    w("Vidéos/export final.mp4", 3);
+    w("Téléchargements/facture.pdf", 30);
+    w("Projets/vieux.txt", 60 * 24 * 40);
+    w("AppData/Local/cache.bin", 1); // zone bruyante
+    w("Projets/.git/index", 1); // dossier caché
+    w("Projets/build.log", 1); // fichier technique
+    w("Projets/target/release/app.exe", 1); // build
+    let ix = crate::index::scan_dir_for_test(&d);
+    let r = ix.recent(10);
+    let names: Vec<String> = r.iter().map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+    assert_eq!(names, vec!["export final.mp4", "facture.pdf", "vieux.txt"], "du plus récent au plus ancien, sans le bruit");
+    // Les dates survivent à la sauvegarde (format v2).
+    let f = d.join("index.bin");
+    let back = crate::index::roundtrip(&ix, &f).expect("relecture");
+    assert_eq!(back.recent(10).len(), 3);
+    assert_eq!(back.recent(1)[0].1, r[0].1);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn recents_filtres() {
+    use crate::recents::noisy_path;
+    assert!(!noisy_path(Path::new(r"Users\moi\Vidéos\montage.mp4")));
+    assert!(noisy_path(Path::new(r"Users\moi\AppData\Roaming\x.json")));
+    assert!(noisy_path(Path::new(r"Program Files\App\data.bin")));
+    assert!(noisy_path(Path::new(r"Dev\projet\node_modules\a.js")));
+    assert!(noisy_path(Path::new(r"Users\moi\Documents\~$rapport.docx")));
+    assert!(noisy_path(Path::new(r"Users\moi\Downloads\film.mkv.crdownload")));
+    assert!(!noisy_path(Path::new(r"Users\moi\Downloads\film.mkv")));
+    assert!(crate::recents::is_recents(&crate::recents::path()));
+    assert!(!crate::recents::path().is_dir(), "chemin virtuel, jamais un vrai dossier");
+}
+
+#[test]
+fn recents_surveillance_en_direct() {
+    let d = tmpdir("recents-live");
+    std::fs::create_dir_all(d.join("Captures")).unwrap();
+    std::fs::create_dir_all(d.join(".cache")).unwrap();
+    // Surveillance d'un dossier de test (jamais des vrais disques dans un test).
+    let live = crate::recents::Live::start(&[d.clone()]);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::fs::write(d.join("Captures").join("partie 1.png"), b"x").unwrap();
+    std::fs::write(d.join(".cache").join("bruit.bin"), b"x").unwrap();
+    let t0 = std::time::Instant::now();
+    while live.generation.load(std::sync::atomic::Ordering::Relaxed) == 0 && t0.elapsed().as_secs() < 5 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let v = crate::recents::collect(None, Some(&live.map()), 50);
+    let names: Vec<&str> = v.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["partie 1.png"]);
+    assert!(v[0].display.as_deref().unwrap().contains("Captures"));
+    drop(live);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Capture de l'onglet « Récents » (E2), sans fenêtre.
+/// `CAPTURE_DIR=<dossier> cargo test --release capture_recents -- --ignored`
+#[test]
+#[ignore]
+fn capture_recents() {
+    let outdir = PathBuf::from(std::env::var("CAPTURE_DIR").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned()));
+    let d = tmpdir("capture-recents");
+    for (rel, mins) in [
+        ("Vidéos/Exports/montage v3 final.mp4", 2u64),
+        ("Images/Captures/Capture 2026-11-20 191502.png", 5),
+        ("Téléchargements/facture-novembre.pdf", 18),
+        ("Documents/notes réunion.docx", 47),
+        ("Dev/explorateur/src/recents.rs", 65),
+        ("Musique/mix.flac", 300),
+    ] {
+        let p = d.join(rel.replace('/', "\\"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, vec![0u8; 1200 * (mins as usize + 1)]).unwrap();
+        set_age(&p, mins);
+    }
+    let live = crate::recents::Live::start(&[d.clone()]);
+    for f in ["Vidéos/Exports/montage v3 final.mp4", "Images/Captures/Capture 2026-11-20 191502.png"] {
+        let p = d.join(f.replace('/', "\\"));
+        std::fs::write(&p, b"maj").unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    // Les autres fichiers viennent d'un « index » de test.
+    let ix = std::sync::Arc::new(std::sync::RwLock::new(crate::index::scan_dir_for_test(&d)));
+    let s = crate::app::Settings { tabs: vec![crate::recents::path()], global_index: false, auto_update: false, folder_sizes: false, ..Default::default() };
+    let mut live = Some(live);
+    capture_png(
+        &outdir.join("recents.png"),
+        s,
+        1400,
+        700,
+        move |app, n| {
+            if n == 0 {
+                app.s.global_index = true; // sans lancer le vrai index
+                app.recents_live = live.take();
+                app.index = Some(crate::index::Index { data: ix.clone(), scanning: Default::default() });
+                app.actions.push(crate::app::Action::Refresh);
+            }
+        },
+        |app| app.tab().view.len() >= 6,
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}

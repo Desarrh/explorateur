@@ -127,7 +127,8 @@ impl App {
                         let hovered = r.hovered();
                         let fill = if active { p.surface } else if hovered { p.hover_bg } else { p.chrome };
                         ui.painter().rect_filled(rect, CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 }, fill);
-                        paint_icon(ui, pos2(rect.left() + 22.0, rect.center().y), 17.0, Icon::Folder, p.accent);
+                        let ic = if crate::recents::is_recents(&t.path) { Icon::Clock } else { Icon::Folder };
+                        paint_icon(ui, pos2(rect.left() + 22.0, rect.center().y), 17.0, ic, p.accent);
                         let mut text_max = rect.width() - 80.0;
                         if t.has_live() {
                             ui.painter().circle_filled(pos2(rect.right() - 44.0, rect.center().y), 4.0, p.live);
@@ -255,6 +256,11 @@ impl App {
                 .changed()
             {
                 self.index = if self.s.global_index { Some(crate::index::Index::start(&self.ctx)) } else { None };
+                if self.s.global_index {
+                    self.start_recents();
+                } else {
+                    self.recents_live = None;
+                }
             }
             if ui.checkbox(&mut self.s.folder_sizes, "Taille des dossiers").changed() {
                 for t in &mut self.tabs {
@@ -397,6 +403,18 @@ impl App {
             return;
         }
         let path = t.path.clone();
+        if crate::recents::is_recents(&path) {
+            frame.show(ui, |ui| {
+                ui.set_width(w - 22.0);
+                ui.horizontal(|ui| {
+                    let (ir, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    icons::paint(ui.painter(), ir, Icon::Clock, p.accent);
+                    ui.label(RichText::new("Récents").color(p.text));
+                    ui.label(RichText::new("· fichiers modifiés sur tous les disques, en direct").color(p.muted));
+                });
+            });
+            return;
+        }
         let resp = frame
             .show(ui, |ui| {
                 ui.set_width(w - 22.0);
@@ -517,6 +535,9 @@ impl App {
                         }
                     }
                     section(ui, "Accès rapide");
+                    if self.s.global_index {
+                        item(ui, Icon::Clock, "Récents", &crate::recents::path(), &mut acts, false);
+                    }
                     for (name, path) in self.quick.clone() {
                         item(ui, Icon::Folder, &name, &path, &mut acts, false);
                     }
@@ -705,7 +726,9 @@ impl App {
         let color = if r.hovered() { p.text } else { p.muted };
         let font = FontId::proportional(socle::theme::taille::ENTETE);
         // Chevron de tri (icône vectorielle) à côté du libellé de la colonne triée
-        let chevron = (self.s.sort == key).then_some(if self.s.asc { Icon::ChevronUp } else { Icon::ChevronDown });
+        // (onglet « Récents » : toujours trié par date, du plus récent au plus ancien)
+        let (sort, asc) = if crate::recents::is_recents(&self.tab().path) { (Sort::Modified, false) } else { (self.s.sort, self.s.asc) };
+        let chevron = (sort == key).then_some(if asc { Icon::ChevronUp } else { Icon::ChevronDown });
         let tw = ui.painter().layout_no_wrap(txt.clone(), font.clone(), color).size().x;
         if right {
             let x = rect.right() - 4.0 - if chevron.is_some() { 14.0 } else { 0.0 };
@@ -728,7 +751,7 @@ impl App {
         let p = self.pal;
         let ai = self.active;
         let has_git = self.repo.as_ref().map(|r| r.loaded && self.tab().path.starts_with(&r.root)).unwrap_or(false);
-        let searching = self.tab().search.is_some();
+        let searching = self.tab().search.is_some() || crate::recents::is_recents(&self.tab().path);
         // colonnes
         let full = ui.available_rect_before_wrap();
         // Colonnes adaptatives : en largeur réduite (double volet), on masque Type puis Modifié.
@@ -877,7 +900,7 @@ impl App {
             }
         }
         let mut acts = Vec::new();
-        let searching = self.tabs[ai].search.is_some();
+        let searching = self.tabs[ai].search.is_some() || crate::recents::is_recents(&self.tabs[ai].path);
         let out = sa.show_rows(ui, cell_h, rows, |ui, range| {
             for row in range {
                 let (row_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), cell_h), Sense::hover());

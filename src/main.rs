@@ -9,6 +9,7 @@ mod fsx;
 mod git;
 mod index;
 mod ops;
+mod recents;
 mod sizes;
 #[cfg(test)]
 mod tests;

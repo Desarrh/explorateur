@@ -207,6 +207,9 @@ impl Tab {
     }
 
     pub fn title(&self) -> String {
+        if crate::recents::is_recents(&self.path) {
+            return "Récents".into();
+        }
         self.path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -453,6 +456,10 @@ pub struct App {
     preview_fallback_tx: Sender<PathBuf>,
     preview_fallback_rx: Receiver<PathBuf>,
     pub index: Option<crate::index::Index>,
+    /// Récents partout (E2) : surveillance en direct des disques fixes.
+    pub recents_live: Option<crate::recents::Live>,
+    recents_seen: u64,
+    recents_loaded_at: Instant,
     /// Mise à jour disponible (bandeau dans la barre d'état).
     pub update: Option<socle::update::Release>,
     pub update_busy: Option<&'static str>,
@@ -600,6 +607,9 @@ impl App {
             preview_fallback_tx: pftx,
             preview_fallback_rx: pfrx,
             index: None,
+            recents_live: None,
+            recents_seen: 0,
+            recents_loaded_at: Instant::now(),
             update: None,
             update_busy: None,
             update_tx: utx,
@@ -652,7 +662,7 @@ impl App {
         };
 
         let arg = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_dir());
-        let mut start: Vec<PathBuf> = app.s.tabs.iter().filter(|p| p.is_dir()).cloned().collect();
+        let mut start: Vec<PathBuf> = app.s.tabs.iter().filter(|p| p.is_dir() || crate::recents::is_recents(p)).cloned().collect();
         if let Some(a) = arg {
             start = vec![a];
             app.s.active = 0;
@@ -666,6 +676,7 @@ impl App {
         app.active = app.s.active.min(app.tabs.len() - 1);
         if app.s.global_index {
             app.index = Some(crate::index::Index::start(&ctx));
+            app.start_recents();
         }
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         if app.s.auto_update && now - app.s.last_update_check > 24 * 3600 {
@@ -780,6 +791,21 @@ impl App {
         let (id, generation, path) = (tab.id, tab.generation, tab.path.clone());
         let tx = self.load_tx.clone();
         let ctx = self.ctx.clone();
+        if crate::recents::is_recents(&path) {
+            // Onglet « Récents » : index global + surveillance en direct, relus sur le disque.
+            let index = self.index.as_ref().map(|i| i.data.clone());
+            let live = self.recents_live.as_ref().map(|l| l.map());
+            self.recents_seen = self.recents_live.as_ref().map(|l| l.generation.load(Ordering::Relaxed)).unwrap_or(0);
+            self.recents_loaded_at = Instant::now();
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                let v = crate::recents::collect(index.as_deref(), live.as_deref(), crate::recents::LIMIT);
+                let ms = t0.elapsed().as_secs_f32() * 1000.0;
+                let _ = tx.send(LoadMsg::Dir { tab: id, generation, res: Ok(v), ms });
+                ctx.request_repaint();
+            });
+            return;
+        }
         std::thread::spawn(move || {
             let t0 = Instant::now();
             let res = fsx::list_dir(&path).map_err(|e| e.to_string());
@@ -787,6 +813,35 @@ impl App {
             let _ = tx.send(LoadMsg::Dir { tab: id, generation, res, ms });
             ctx.request_repaint();
         });
+    }
+
+    /// Démarre la surveillance des disques pour les « Récents partout ».
+    pub fn start_recents(&mut self) {
+        if self.recents_live.is_none() {
+            self.recents_live = Some(crate::recents::Live::start(&crate::index::fixed_roots()));
+        }
+    }
+
+    /// Onglet « Récents » affiché et nouveaux fichiers vus : rechargement (au plus toutes les 2 s).
+    fn tick_recents(&mut self) {
+        let Some(g) = self.recents_live.as_ref().map(|l| l.generation.load(Ordering::Relaxed)) else { return };
+        if g == self.recents_seen {
+            return;
+        }
+        let showing: Vec<usize> = (0..self.tabs.len())
+            .filter(|&i| crate::recents::is_recents(&self.tabs[i].path) && (i == self.active || Some(i) == self.split_other))
+            .collect();
+        if showing.is_empty() {
+            return;
+        }
+        let wait = Duration::from_secs(2).saturating_sub(self.recents_loaded_at.elapsed());
+        if !wait.is_zero() {
+            self.ctx.request_repaint_after(wait);
+            return;
+        }
+        for i in showing {
+            self.start_load(i);
+        }
     }
 
     fn navigate(&mut self, path: PathBuf) {
@@ -802,6 +857,9 @@ impl App {
 
     /// Mémorise la visite d'un dossier (pour « Aller à », classé par fréquence et récence).
     pub fn record_visit(&mut self, p: &Path) {
+        if crate::recents::is_recents(p) {
+            return;
+        }
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         let e = self.s.visits.entry(p.to_string_lossy().into_owned()).or_insert((0, now));
         e.0 = e.0.saturating_add(1);
@@ -864,6 +922,8 @@ impl App {
             })
             .collect();
         let by_score = !needle.is_empty() && !searching;
+        // Onglet « Récents » : toujours du plus récent au plus ancien.
+        let (sort, asc) = if crate::recents::is_recents(&tab.path) && !by_score { (Sort::Modified, false) } else { (sort, asc) };
         scored.sort_by(|a, b| {
             let (ea, eb) = (&src[a.0], &src[b.0]);
             eb.is_dir.cmp(&ea.is_dir).then_with(|| {
@@ -923,7 +983,7 @@ impl App {
     fn sync_watches(&mut self) {
         let Some(w) = self.watcher.as_mut() else { return };
         let mut want: HashMap<PathBuf, RecursiveMode> = HashMap::new();
-        for t in &self.tabs {
+        for t in self.tabs.iter().filter(|t| !crate::recents::is_recents(&t.path)) {
             want.insert(t.path.clone(), RecursiveMode::NonRecursive);
         }
         if self.s.dev {
@@ -1413,6 +1473,7 @@ impl App {
         self.process_ops();
         self.process_git();
         self.tick_bursts();
+        self.tick_recents();
         self.sync_watches();
         if self.drives_at.elapsed() > Duration::from_secs(10) {
             self.drives = fsx::drives();
@@ -1741,7 +1802,7 @@ impl App {
     fn apply(&mut self, a: Action) {
         match a {
             Action::Navigate(p) => {
-                if p.is_dir() {
+                if p.is_dir() || crate::recents::is_recents(&p) {
                     self.navigate(p);
                 } else if p.exists() {
                     let _ = open::that_detached(&p);
@@ -1856,6 +1917,10 @@ impl App {
                 );
             }
             Action::Paste(dst) => {
+                if crate::recents::is_recents(&dst) {
+                    self.toast("« Récents » n’est pas un vrai dossier : colle dans un dossier", true);
+                    return;
+                }
                 #[cfg(windows)]
                 if let Some((files, cut)) = winx::get_files() {
                     if files.is_empty() {
@@ -1917,6 +1982,10 @@ impl App {
             Action::NewFolder | Action::NewFile => {
                 let folder = matches!(a, Action::NewFolder);
                 let dir = self.tab().path.clone();
+                if crate::recents::is_recents(&dir) {
+                    self.toast("« Récents » n’est pas un vrai dossier : rien ne peut y être créé", true);
+                    return;
+                }
                 let p = fsx::unique_name(&dir, if folder { "Nouveau dossier" } else { "Nouveau fichier.txt" });
                 let r = if folder { std::fs::create_dir(&p) } else { std::fs::write(&p, b"") };
                 match r {
@@ -1970,6 +2039,9 @@ impl App {
                 }
             }
             Action::DropInto { paths, dst, copy } => {
+                if crate::recents::is_recents(&dst) {
+                    return;
+                }
                 let paths: Vec<PathBuf> = paths.into_iter().filter(|p| p != &dst && p.parent() != Some(&dst)).collect();
                 if paths.is_empty() {
                     return;
@@ -1990,6 +2062,9 @@ impl App {
             }
             Action::Up => {
                 let cur = self.tab().path.clone();
+                if crate::recents::is_recents(&cur) {
+                    return;
+                }
                 if let Some(parent) = cur.parent() {
                     let parent = parent.to_path_buf();
                     self.navigate(parent);

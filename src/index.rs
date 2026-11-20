@@ -24,8 +24,21 @@ const SKIP_DIRS: [&str; 11] = [
 struct Node {
     off: u32,
     len: u16,
-    is_dir: bool,
+    /// `DIR` | `NOISY`
+    flags: u8,
     parent: u32,
+    /// Dernière modification, en minutes depuis 1970 (0 = inconnue). Sert aux « Récents partout ».
+    mtime: u32,
+}
+
+const DIR: u8 = 1;
+/// Dans une zone « bruyante » (AppData, Program Files, dossiers cachés…) : exclu des récents.
+const NOISY: u8 = 2;
+
+impl Node {
+    fn is_dir(&self) -> bool {
+        self.flags & DIR != 0
+    }
 }
 
 /// Noms en minuscules seulement (Windows ne distingue pas la casse) : la vraie casse
@@ -44,14 +57,40 @@ pub struct Hit {
 }
 
 impl Data {
-    fn push(&mut self, name: &str, is_dir: bool, parent: u32) -> u32 {
+    fn push(&mut self, name: &str, is_dir: bool, parent: u32, mtime: u32) -> u32 {
         let off = self.lower.len() as u32;
         let low = name.to_lowercase();
         let len = low.len().min(u16::MAX as usize);
+        let noisy = (parent != NONE && self.nodes[parent as usize].flags & NOISY != 0)
+            || (is_dir && crate::recents::noisy_dir(&low))
+            || (!is_dir && crate::recents::noisy_file(&low));
         self.lower.push_str(&low[..len]);
         self.lower.push('\u{0}'); // séparateur : une recherche ne déborde pas sur le nom suivant
-        self.nodes.push(Node { off, len: len as u16, is_dir, parent });
+        let flags = if is_dir { DIR } else { 0 } | if noisy { NOISY } else { 0 };
+        self.nodes.push(Node { off, len: len as u16, flags, parent, mtime });
         (self.nodes.len() - 1) as u32
+    }
+
+    /// Les `limit` fichiers modifiés le plus récemment (hors zones bruyantes), du plus récent au
+    /// plus ancien : une passe sur les nœuds avec un tas de taille `limit`.
+    pub fn recent(&self, limit: usize) -> Vec<(PathBuf, u32)> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut heap: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::with_capacity(limit + 1);
+        for (i, n) in self.nodes.iter().enumerate() {
+            if n.flags != 0 || n.mtime == 0 {
+                continue;
+            }
+            if heap.len() < limit {
+                heap.push(Reverse((n.mtime, i as u32)));
+            } else if heap.peek().map(|r| r.0.0 < n.mtime).unwrap_or(false) {
+                heap.pop();
+                heap.push(Reverse((n.mtime, i as u32)));
+            }
+        }
+        let mut v: Vec<(u32, u32)> = heap.into_iter().map(|r| r.0).collect();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        v.into_iter().map(|(m, i)| (self.path(i), m)).collect()
     }
 
     fn shrink(&mut self) {
@@ -117,7 +156,7 @@ impl Data {
             if nlen as usize == q.len() {
                 score += 500;
             }
-            if self.nodes[idx as usize].is_dir {
+            if self.nodes[idx as usize].is_dir() {
                 score += 50;
             }
             cands.push((score, idx));
@@ -149,7 +188,7 @@ impl Data {
         cands
             .into_iter()
             .take(limit)
-            .map(|(_, i)| Hit { path: self.path(i), is_dir: self.nodes[i as usize].is_dir, name: self.name(i).to_string() })
+            .map(|(_, i)| Hit { path: self.path(i), is_dir: self.nodes[i as usize].is_dir(), name: self.name(i).to_string() })
             .collect()
     }
 
@@ -158,11 +197,12 @@ impl Data {
         use std::io::Write;
         let tmp = file.with_extension("tmp");
         let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-        w.write_all(b"EXPLIDX1")?;
+        w.write_all(b"EXPLIDX2")?;
         w.write_all(&(self.nodes.len() as u32).to_le_bytes())?;
         for (i, n) in self.nodes.iter().enumerate() {
             w.write_all(&n.parent.to_le_bytes())?;
-            w.write_all(&[n.is_dir as u8])?;
+            w.write_all(&[n.is_dir() as u8])?;
+            w.write_all(&n.mtime.to_le_bytes())?;
             let name = self.name(i as u32).as_bytes();
             w.write_all(&(name.len() as u16).to_le_bytes())?;
             w.write_all(name)?;
@@ -174,20 +214,33 @@ impl Data {
 
     fn load(file: &Path) -> Option<Data> {
         let b = std::fs::read(file).ok()?;
-        if b.len() < 12 || &b[..8] != b"EXPLIDX1" {
-            return None;
-        }
-        let n = u32::from_le_bytes(b[8..12].try_into().ok()?) as usize;
+        // v1 : sans date (lu quand même, les récents viendront au prochain parcours).
+        let v2 = match b.get(..8)? {
+            b"EXPLIDX2" => true,
+            b"EXPLIDX1" => false,
+            _ => return None,
+        };
+        let n = u32::from_le_bytes(b.get(8..12)?.try_into().ok()?) as usize;
         let mut d = Data::default();
         d.nodes.reserve(n);
         let mut k = 12;
         for _ in 0..n {
             let parent = u32::from_le_bytes(b.get(k..k + 4)?.try_into().ok()?);
             let is_dir = *b.get(k + 4)? != 0;
-            let len = u16::from_le_bytes(b.get(k + 5..k + 7)?.try_into().ok()?) as usize;
-            let name = std::str::from_utf8(b.get(k + 7..k + 7 + len)?).ok()?;
-            d.push(name, is_dir, parent);
-            k += 7 + len;
+            k += 5;
+            let mtime = if v2 {
+                k += 4;
+                u32::from_le_bytes(b.get(k - 4..k)?.try_into().ok()?)
+            } else {
+                0
+            };
+            let len = u16::from_le_bytes(b.get(k..k + 2)?.try_into().ok()?) as usize;
+            let name = std::str::from_utf8(b.get(k + 2..k + 2 + len)?).ok()?;
+            if parent != NONE && parent as usize >= d.nodes.len() {
+                return None; // fichier abîmé
+            }
+            d.push(name, is_dir, parent, mtime);
+            k += 2 + len;
         }
         d.built = std::fs::metadata(file).and_then(|m| m.modified()).ok();
         d.shrink();
@@ -243,6 +296,11 @@ impl Index {
     }
 }
 
+/// Racines des disques fixes (`C:\`, `D:\`…).
+pub fn fixed_roots() -> Vec<PathBuf> {
+    crate::fsx::drives().into_iter().map(|d| d.root).filter(|r| is_fixed(r)).collect()
+}
+
 /// Parcourt tous les disques fixes.
 fn scan_all() -> Data {
     let t0 = Instant::now();
@@ -252,14 +310,14 @@ fn scan_all() -> Data {
             continue;
         }
         let label = drive.label.clone(); // « C: »
-        let root = d.push(&label, true, NONE);
+        let root = d.push(&label, true, NONE, 0);
         let mut stack: Vec<(PathBuf, u32)> = vec![(drive.root.clone(), root)];
         while let Some((dir, id)) = stack.pop() {
-            for (name, is_dir) in list_names(&dir) {
+            for (name, is_dir, mtime) in list_names(&dir) {
                 if is_dir && SKIP_DIRS.contains(&name.to_lowercase().as_str()) {
                     continue;
                 }
-                let child = d.push(&name, is_dir, id);
+                let child = d.push(&name, is_dir, id, mtime);
                 if is_dir {
                     stack.push((dir.join(&name), child));
                 }
@@ -300,7 +358,7 @@ fn is_fixed(_root: &Path) -> bool {
 
 /// Noms d'un dossier (sans suivre les liens/jonctions), lus par gros blocs.
 #[cfg(windows)]
-fn list_names(dir: &Path) -> Vec<(String, bool)> {
+fn list_names(dir: &Path) -> Vec<(String, bool, u32)> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -326,7 +384,8 @@ fn list_names(dir: &Path) -> Vec<(String, bool)> {
             let is_dir = attr & FILE_ATTRIBUTE_DIRECTORY != 0;
             let surrogate = attr & FILE_ATTRIBUTE_REPARSE_POINT != 0 && data.dwReserved0 & 0x2000_0000 != 0;
             if !(is_dir && surrogate) {
-                out.push((name, is_dir));
+                let ft = ((data.ftLastWriteTime.dwHighDateTime as u64) << 32) | data.ftLastWriteTime.dwLowDateTime as u64;
+                out.push((name, is_dir, filetime_minutes(ft)));
             }
         }
         if unsafe { FindNextFileW(h, &mut data) } == 0 {
@@ -338,20 +397,26 @@ fn list_names(dir: &Path) -> Vec<(String, bool)> {
 }
 
 #[cfg(not(windows))]
-fn list_names(dir: &Path) -> Vec<(String, bool)> {
+fn list_names(dir: &Path) -> Vec<(String, bool, u32)> {
     std::fs::read_dir(dir)
-        .map(|rd| rd.flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.path().is_dir())).collect())
+        .map(|rd| rd.flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), e.path().is_dir(), 0)).collect())
         .unwrap_or_default()
+}
+
+/// FILETIME (100 ns depuis 1601) → minutes depuis 1970.
+fn filetime_minutes(ft: u64) -> u32 {
+    const EPOCH_DIFF_SECS: u64 = 11_644_473_600;
+    (ft / 10_000_000).saturating_sub(EPOCH_DIFF_SECS).checked_div(60).unwrap_or(0).min(u32::MAX as u64) as u32
 }
 
 #[cfg(test)]
 pub fn scan_dir_for_test(root: &Path) -> Data {
     let mut d = Data::default();
-    let r = d.push(&root.to_string_lossy().trim_end_matches('\\').to_string(), true, NONE);
+    let r = d.push(&root.to_string_lossy().trim_end_matches('\\').to_string(), true, NONE, 0);
     let mut stack = vec![(root.to_path_buf(), r)];
     while let Some((dir, id)) = stack.pop() {
-        for (name, is_dir) in list_names(&dir) {
-            let c = d.push(&name, is_dir, id);
+        for (name, is_dir, mtime) in list_names(&dir) {
+            let c = d.push(&name, is_dir, id, mtime);
             if is_dir {
                 stack.push((dir.join(&name), c));
             }
