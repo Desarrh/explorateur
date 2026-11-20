@@ -27,12 +27,17 @@ if ($running.Count -gt 0 -and $Relancer) {
     foreach ($r in $running) { [void]$r.CloseMainWindow() }
     $running | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
 }
-if (Test-Path $dist) {
+# Anciens .old qui ne tournent plus : on les supprime (ceux encore utilisés sont verrouillés, on les laisse).
+Get-ChildItem (Split-Path $dist) -Filter 'Explorateur*.old' -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+$copied = $false
+try { Copy-Item $new $dist -Force; $copied = $true } catch {}
+if (-not $copied) {
+    # Exe en cours d'utilisation : on le renomme (nom unique si un .old tourne encore) puis on copie.
     $old = [IO.Path]::ChangeExtension($dist, 'old')
-    Remove-Item $old -Force -ErrorAction SilentlyContinue
+    if (Test-Path $old) { $old = Join-Path (Split-Path $dist) ("Explorateur." + (Get-Date -Format 'yyyyMMdd-HHmmss') + ".old") }
     try { Move-Item $dist $old -Force } catch { Write-Host "Impossible de renommer l'exe en cours : $_" -ForegroundColor Red; exit 1 }
+    Copy-Item $new $dist -Force
 }
-Copy-Item $new $dist -Force
 if ($running.Count -gt 0 -and -not $Relancer) {
     Write-Host "Explorateur mis à jour : $dist (la fenêtre ouverte garde l'ancienne version jusqu'à sa fermeture)." -ForegroundColor Green
 } else {
