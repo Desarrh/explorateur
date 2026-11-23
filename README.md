@@ -89,10 +89,17 @@ All numbers measured on the author's machine (Windows 11, NVMe SSD, 5120×1440 d
   and build folders, and `.log` / `.tmp` / `.part` files. Only there while "Recherche dans tous les disques" is on.
 - **Disk-space map** (<kbd>Ctrl</kbd>+<kbd>3</kbd>), WizTree-style: the folder as nested rectangles sized by what they take,
   colored by type; click to dive in, right-click to open, show or send to the recycle bin
+- **Color labels**: right-click → *Couleur* to tint a file or folder (8 colors readable in both themes); the color
+  follows the item when it is renamed or moved from the app
+- **Your own sidebar**: remove any quick-access entry (defaults included), add folders by right-click or by dragging
+  them onto the section title, reorder by dragging, restore the defaults; pinned folders live in **named,
+  collapsible groups** ("Dev", "Game design"…) and can be dragged from one group to another
+- File icons: the app's vector icons, or the **Windows icons** (loaded in the background, cached per type)
 - Type-ahead, hidden files toggle, cream light theme / navy dark theme
 
 **File operations**
 - Copy / cut / paste compatible with Windows Explorer's clipboard, drag & drop in, **out to the desktop, Discord, browsers…**
+- Right-click menu with the actions you look for at a glance: rename in the accent color, delete in red
 - Rename (<kbd>F2</kbd>, extension preserved), **batch rename** (pattern `{nom} {n:3} {ext} {date}`, find/replace, regex, conflict preview)
 - **Undo** (<kbd>Ctrl</kbd>+<kbd>Z</kbd>, last 100 steps) for copy, move, rename and batch rename, new folder or file,
   recycle bin, zip, unzip, conversions
@@ -157,6 +164,8 @@ Shared code (theme, icons, widgets, image decoders, settings, single instance, s
 | `src/thumbs.rs` | Thumbnails (socle decoders + disk cache, Windows thumbnail provider) |
 | `src/ops.rs` | File operation queue with undo |
 | `src/git.rs` | Git status, diff, commit, push, pass snapshots |
+| `src/places.rs` | Sidebar: custom quick access, pinned groups, color labels |
+| `src/sysicons.rs` | Windows icons (background loading, per-type cache) |
 | `src/winx.rs` | Windows clipboard, drag out, shell menu, default explorer |
 | `src/fsx.rs` | Directory reading, file types, the one list of noisy folders |
 | `src/viewer.rs` | Lecteur universel link (open, quick look, `--formats`, `--convert`) |
