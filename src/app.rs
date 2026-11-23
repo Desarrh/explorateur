@@ -34,7 +34,17 @@ pub struct Settings {
     pub space_map: bool,
     pub preview: bool,
     pub show_hidden: bool,
+    /// Ancienne liste d'épingles : lue une fois puis migrée dans `pin_groups` (« Épinglés »).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pinned: Vec<PathBuf>,
+    /// Épingles rangées en groupes nommés repliables.
+    pub pin_groups: Vec<crate::places::PinGroup>,
+    /// Accès rapide personnalisé (`None` : entrées par défaut).
+    pub quick_custom: Option<Vec<crate::places::QuickItem>>,
+    /// Couleur choisie par chemin (en minuscules) : 1..=8.
+    pub colors: HashMap<String, u8>,
+    /// Icônes Windows (celles du système) au lieu des icônes vectorielles de l'app.
+    pub windows_icons: bool,
     pub tabs: Vec<PathBuf>,
     pub active: usize,
     pub sort: Sort,
@@ -70,6 +80,10 @@ impl Default for Settings {
             preview: true,
             show_hidden: false,
             pinned: vec![],
+            pin_groups: vec![],
+            quick_custom: None,
+            colors: HashMap::new(),
+            windows_icons: false,
             tabs: vec![],
             active: 0,
             sort: Sort::Name,
@@ -311,6 +325,8 @@ pub enum Action {
     CopyPath,
     Pin(PathBuf),
     Unpin(PathBuf),
+    /// Accès rapide, groupes d'épingles, couleurs (voir places.rs).
+    Place(crate::places::PlaceAction),
     Terminal(PathBuf),
     Code(PathBuf),
     Reveal(PathBuf),
@@ -441,6 +457,10 @@ pub struct App {
     typeahead: (String, Instant),
     v_was_down: bool,
     pub quick: Vec<(String, PathBuf)>,
+    /// Fenêtre de saisie d'un nom de groupe d'épingles.
+    pub name_prompt: Option<crate::places::NamePrompt>,
+    /// Icônes Windows (réglage « Icônes des fichiers »).
+    pub sysicons: crate::sysicons::SysIcons,
     pub watch_ok: bool,
     pub ctx: egui::Context,
     /// Fichiers à glisser hors de la fenêtre (Bureau, Discord…) : traité par la boucle principale.
@@ -535,7 +555,13 @@ impl Settings {
 type Git2 = git::Git;
 
 impl App {
-    pub fn new(ctx: &egui::Context, s: Settings) -> App {
+    pub fn new(ctx: &egui::Context, mut s: Settings) -> App {
+        // Anciennes épingles (liste unique) → groupe « Épinglés ».
+        if !s.pinned.is_empty() && s.pin_groups.is_empty() {
+            let paths = std::mem::take(&mut s.pinned);
+            s.pin_groups.push(crate::places::PinGroup { name: "Épinglés".into(), paths, collapsed: false });
+        }
+        s.pinned.clear();
         let ctx = ctx.clone();
         let (ptx, prx) = unbounded();
         let (ftx, frx) = unbounded();
@@ -674,6 +700,8 @@ impl App {
             typeahead: (String::new(), Instant::now()),
             v_was_down: false,
             quick,
+            name_prompt: None,
+            sysicons: crate::sysicons::SysIcons::new(&ctx),
             ctx: ctx.clone(),
         };
 
@@ -1126,6 +1154,7 @@ impl App {
             };
             let applied = self.apply_path(&p, Some(fin)).unwrap_or(fin);
             self.thumbs.invalidate(&p);
+            self.sysicons.invalidate(&p);
             if self.sizes.invalidate(&p) {
                 self.sizes_for = None;
             }
@@ -1237,8 +1266,9 @@ impl App {
         while let Ok(ev) = self.ops.rx.try_recv() {
             match ev {
                 OpEvent::Progress { label, done, total, current } => self.progress = Some((label, done, total, current)),
-                OpEvent::Finished { label, errors, touched, undo } => {
+                OpEvent::Finished { label, errors, touched, undo, moved } => {
                     self.progress = None;
+                    self.follow_moves(&moved);
                     for p in &touched {
                         self.apply_path(p, None);
                         self.sizes.invalidate(p);
@@ -1620,6 +1650,7 @@ impl App {
             self.bring_front = true;
         }
         self.thumbs.poll(&self.ctx);
+        self.sysicons.poll(&self.ctx);
         self.process_loads();
         self.process_watch();
         self.process_ops();
@@ -2159,6 +2190,7 @@ impl App {
                 }
                 match std::fs::rename(&r.path, &target) {
                     Ok(()) => {
+                        self.follow_moves(&[(r.path.clone(), target.clone())]);
                         self.undo.push(crate::ops::Undo::Moved(vec![(r.path.clone(), target.clone())]));
                         self.apply_path(&r.path, None);
                         self.apply_path(&target, None);
@@ -2199,12 +2231,9 @@ impl App {
                 self.ctx.copy_text(text);
                 self.toast("Chemin copié", false);
             }
-            Action::Pin(p) => {
-                if !self.s.pinned.contains(&p) {
-                    self.s.pinned.push(p);
-                }
-            }
-            Action::Unpin(p) => self.s.pinned.retain(|x| x != &p),
+            Action::Pin(p) => self.apply_place(crate::places::PlaceAction::PinInto(p, 0)),
+            Action::Unpin(p) => self.apply_place(crate::places::PlaceAction::Unpin(p)),
+            Action::Place(a) => self.apply_place(a),
             Action::Terminal(p) => winx::open_terminal(&p),
             Action::Code(p) => {
                 if !winx::open_in_code(&p) {

@@ -9,8 +9,10 @@ mod fsx;
 mod git;
 mod index;
 mod ops;
+mod places;
 mod recents;
 mod sizes;
+mod sysicons;
 mod spacemap;
 #[cfg(test)]
 mod tests;

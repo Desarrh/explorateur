@@ -155,7 +155,7 @@ impl App {
             "claude" => Action::ClaudeHere(cur),
             "explorer-windows" => Action::Reveal(cur),
             "epingler" => {
-                if self.s.pinned.contains(&cur) { Action::Unpin(cur) } else { Action::Pin(cur) }
+                if self.is_pinned(&cur) { Action::Unpin(cur) } else { Action::Pin(cur) }
             }
             "maj" => Action::CheckUpdate,
             "aide" => {

@@ -462,6 +462,9 @@ fn rafale_regroupement() {
 /// Rendu sans fenêtre d'une image de l'app en PNG (règle n° 0 : rien à l'écran).
 /// `prepare` règle l'app ; `ready` dit quand l'image est prête.
 #[cfg(test)]
+/// Événements egui à passer à la prochaine image d'une capture (clic droit pour un menu…).
+static CAPTURE_EVENTS: std::sync::Mutex<Vec<egui::Event>> = std::sync::Mutex::new(Vec::new());
+
 pub fn capture_png(
     out: &Path,
     s: crate::app::Settings,
@@ -483,6 +486,8 @@ pub fn capture_png(
         prepare(&mut app, n);
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32))),
+            // événements egui préparés par le test (jamais d'entrée simulée au niveau du système)
+            events: std::mem::take(&mut *CAPTURE_EVENTS.lock().unwrap()),
             ..Default::default()
         };
         let o = ctx.run_ui(raw, |ui| {
@@ -494,7 +499,7 @@ pub fn capture_png(
         buf.iter_mut().for_each(|px| *px = [app.pal.bg.r(), app.pal.bg.g(), app.pal.bg.b(), 255]);
         renderer.render(&mut BufferMutRef::new(&mut buf, w, h), &prims, &o.textures_delta, o.pixels_per_point);
         n += 1;
-        if (ready(&app) && n > 3) || t0.elapsed().as_secs() > 20 {
+        if (ready(&app) && n > 12) || t0.elapsed().as_secs() > 20 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -1024,5 +1029,168 @@ fn copie_ignore_les_jonctions() {
     assert_eq!(std::fs::read_to_string(d.join("dst").join("src").join("a.txt")).unwrap(), "a");
     assert!(!d.join("dst").join("src").join("boucle").exists(), "jonction non copiée");
     let _ = std::fs::remove_dir(src.join("boucle")); // retire la jonction, pas sa cible
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Couleurs : les 8 teintes restent lisibles sur les deux fonds (contraste ≥ 3:1).
+#[test]
+fn couleurs_lisibles_clair_et_sombre() {
+    fn lum(c: egui::Color32) -> f64 {
+        let f = |v: u8| {
+            let v = v as f64 / 255.0;
+            if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+    }
+    let ratio = |a: egui::Color32, b: egui::Color32| {
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    };
+    for dark in [false, true] {
+        let bg = socle::theme::palette(dark).surface;
+        for i in 1..=8u8 {
+            let c = crate::places::file_color(dark, i).unwrap();
+            assert!(ratio(c, bg) >= 3.0, "teinte {i} ({}) : contraste {:.2}", if dark { "sombre" } else { "clair" }, ratio(c, bg));
+        }
+        assert!(crate::places::file_color(dark, 0).is_none() && crate::places::file_color(dark, 9).is_none());
+    }
+}
+
+/// Accès rapide, groupes d'épingles, couleurs : actions, migration, suivi des renommages.
+#[test]
+fn barre_laterale_groupes_et_couleurs() {
+    use crate::places::PlaceAction as P;
+    unsafe { std::env::set_var("SOCLE_TEST", "1") };
+    let d = tmpdir("places");
+    for n in ["Dev", "Godot", "Jeux", "Jeux/Sous"] {
+        std::fs::create_dir_all(d.join(n)).unwrap();
+    }
+    let s = crate::app::Settings {
+        tabs: vec![d.clone()],
+        pinned: vec![d.join("Dev"), d.join("Godot")], // anciennes épingles
+        global_index: false,
+        auto_update: false,
+        folder_sizes: false,
+        ..Default::default()
+    };
+    let ctx = egui::Context::default();
+    let mut app = crate::app::App::new(&ctx, s);
+    // Migration : un groupe « Épinglés » avec les deux dossiers.
+    assert_eq!(app.s.pin_groups.len(), 1);
+    assert_eq!(app.s.pin_groups[0].name, "Épinglés");
+    assert_eq!(app.s.pin_groups[0].paths, vec![d.join("Dev"), d.join("Godot")]);
+    assert!(app.s.pinned.is_empty());
+    // Nouveau groupe, épingle dedans, déplacement entre groupes.
+    app.s.pin_groups.push(crate::places::PinGroup { name: "Game design".into(), paths: vec![], collapsed: true });
+    app.apply_place(P::PinInto(d.join("Jeux"), 1));
+    assert_eq!(app.s.pin_groups[1].paths, vec![d.join("Jeux")]);
+    assert!(!app.s.pin_groups[1].collapsed, "le groupe s'ouvre pour montrer l'épingle");
+    app.apply_place(P::MovePin { from: (0, 1), to: (1, 0) });
+    assert_eq!(app.s.pin_groups[0].paths, vec![d.join("Dev")]);
+    assert_eq!(app.s.pin_groups[1].paths, vec![d.join("Godot"), d.join("Jeux")]);
+    app.apply_place(P::PinInto(d.join("Dev"), 1)); // une épingle n'est que dans un groupe
+    assert!(app.s.pin_groups[0].paths.is_empty());
+    assert!(app.is_pinned(&d.join("Dev")));
+    app.apply_place(P::Unpin(d.join("Dev")));
+    assert!(!app.is_pinned(&d.join("Dev")));
+    // Accès rapide : retirer, ajouter, réordonner, rétablir.
+    let defaults = app.quick_items();
+    assert!(!defaults.is_empty());
+    app.apply_place(P::QuickRemove(0));
+    assert_eq!(app.quick_items().len(), defaults.len() - 1);
+    app.apply_place(P::QuickAdd(vec![d.join("Jeux")]));
+    app.apply_place(P::QuickAdd(vec![d.join("Jeux")])); // pas de doublon
+    let q = app.quick_items();
+    assert_eq!(q.last().unwrap().path, d.join("Jeux"));
+    assert_eq!(q.len(), defaults.len());
+    app.apply_place(P::QuickMove(q.len() - 1, 0));
+    assert_eq!(app.quick_items()[0].path, d.join("Jeux"));
+    app.apply_place(P::QuickReset);
+    assert_eq!(app.quick_items(), defaults);
+    // Couleurs : posées, retirées, et elles suivent un renommage (contenu compris).
+    app.apply_place(P::SetColor(vec![d.join("Jeux"), d.join("Jeux").join("Sous")], 3));
+    assert!(app.color_of(&d.join("JEUX")).is_some(), "insensible à la casse");
+    app.follow_moves(&[(d.join("Jeux"), d.join("Jeux vidéo"))]);
+    assert!(app.color_of(&d.join("Jeux")).is_none());
+    assert!(app.color_of(&d.join("Jeux vidéo")).is_some());
+    assert!(app.color_of(&d.join("Jeux vidéo").join("Sous")).is_some());
+    assert_eq!(app.s.pin_groups[1].paths[1], d.join("Jeux vidéo"), "l'épingle suit aussi");
+    app.apply_place(P::SetColor(vec![d.join("Jeux vidéo")], 0));
+    assert!(app.color_of(&d.join("Jeux vidéo")).is_none());
+    drop(app);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Icônes Windows : le Shell donne une vraie icône (48 px) pour un type de fichier.
+#[test]
+fn icone_windows_lue() {
+    let d = tmpdir("icone");
+    let f = d.join("note.txt");
+    std::fs::write(&f, "x").unwrap();
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+    }
+    let img = crate::thumbs::shell_icon(&f, 48).expect("icône");
+    assert!(img.size[0] >= 16 && img.size[1] >= 16, "{:?}", img.size);
+    assert!(img.pixels.iter().any(|p| p.a() > 0), "pas vide");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Captures de la barre latérale (groupes, accès rapide), des couleurs, des icônes Windows et
+/// du menu clic droit, en clair et en sombre, sans fenêtre.
+/// `CAPTURE_DIR=<dossier> cargo test --release capture_places -- --ignored`
+#[test]
+#[ignore]
+fn capture_places() {
+    let outdir = PathBuf::from(std::env::var("CAPTURE_DIR").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned()));
+    let d = tmpdir("capture-places");
+    for n in ["Dev", "Godot", "Game design", "Jeux", "Rendus"] {
+        std::fs::create_dir_all(d.join(n)).unwrap();
+    }
+    for f in ["notes.txt", "budget.xlsx", "rapport.pdf", "photo.png", "musique.mp3", "outil.exe"] {
+        std::fs::write(d.join(f), b"x").unwrap();
+    }
+    for (dark, icons) in [(false, false), (true, false), (false, true)] {
+        let mut colors = std::collections::HashMap::new();
+        colors.insert(crate::places::color_key(&d.join("Dev")), 6u8);
+        colors.insert(crate::places::color_key(&d.join("Jeux")), 1u8);
+        colors.insert(crate::places::color_key(&d.join("rapport.pdf")), 4u8);
+        colors.insert(crate::places::color_key(&d.join("budget.xlsx")), 3u8);
+        let s = crate::app::Settings {
+            tabs: vec![d.clone()],
+            dark,
+            windows_icons: icons,
+            preview: false,
+            colors,
+            pin_groups: vec![
+                crate::places::PinGroup { name: "Dev".into(), paths: vec![d.join("Dev"), d.join("Godot")], collapsed: false },
+                crate::places::PinGroup { name: "Game design".into(), paths: vec![d.join("Game design"), d.join("Jeux")], collapsed: false },
+                crate::places::PinGroup { name: "Rendus".into(), paths: vec![d.join("Rendus")], collapsed: true },
+            ],
+            global_index: false,
+            auto_update: false,
+            folder_sizes: false,
+            ..Default::default()
+        };
+        let name = format!("places-{}{}.png", if dark { "sombre" } else { "clair" }, if icons { "-icones-windows" } else { "" });
+        capture_png(
+            &outdir.join(name),
+            s,
+            1300,
+            760,
+            move |app, n| {
+                // Clic droit sur la 1re ligne de fichier, pour montrer le menu (événements egui).
+                if n == 8 && !icons {
+                    let at = egui::pos2(420.0, 150.0 + 34.0 * 5.0);
+                    let mut ev = CAPTURE_EVENTS.lock().unwrap();
+                    ev.push(egui::Event::PointerMoved(at));
+                    ev.push(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: true, modifiers: Default::default() });
+                    ev.push(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed: false, modifiers: Default::default() });
+                }
+                let _ = app;
+            },
+            |app| app.tab().view.len() >= 11,
+        );
+    }
     let _ = std::fs::remove_dir_all(&d);
 }

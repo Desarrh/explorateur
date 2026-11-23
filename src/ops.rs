@@ -65,7 +65,8 @@ impl Op {
 
 pub enum OpEvent {
     Progress { label: &'static str, done: usize, total: usize, current: String },
-    Finished { label: &'static str, errors: Vec<String>, touched: Vec<PathBuf>, undo: Option<Undo> },
+    /// `moved` : (avant, après) des éléments renommés ou déplacés (couleurs et épingles les suivent).
+    Finished { label: &'static str, errors: Vec<String>, touched: Vec<PathBuf>, undo: Option<Undo>, moved: Vec<(PathBuf, PathBuf)> },
 }
 
 pub struct Ops {
@@ -105,6 +106,7 @@ fn run(op: Op, ev: &Sender<OpEvent>, cancel: &AtomicBool, ctx: &egui::Context) {
     let mut errors = Vec::new();
     let mut touched = Vec::new();
     let mut undo = None;
+    let mut moved_pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
     let progress = |done: usize, total: usize, cur: &Path| {
         let _ = ev.send(OpEvent::Progress { label, done, total, current: name_of(cur) });
         ctx.request_repaint();
@@ -165,6 +167,7 @@ fn run(op: Op, ev: &Sender<OpEvent>, cancel: &AtomicBool, ctx: &egui::Context) {
                 }
             }
             if !moved.is_empty() {
+                moved_pairs.extend(moved.iter().cloned());
                 undo = Some(Undo::Moved(moved));
             }
         }
@@ -173,12 +176,14 @@ fn run(op: Op, ev: &Sender<OpEvent>, cancel: &AtomicBool, ctx: &egui::Context) {
             let back: Vec<(PathBuf, PathBuf)> = pairs.into_iter().map(|(from, to)| (to, from)).collect();
             let (done, errs) = move_batch(&back, cancel, &progress);
             errors.extend(errs);
+            moved_pairs.extend(done.iter().cloned());
             touched.extend(done.into_iter().flat_map(|(a, b)| [a, b]));
         }
         Op::Rename(pairs) => {
             let (done, errs) = move_batch(&pairs, cancel, &progress);
             errors.extend(errs);
             touched.extend(done.iter().flat_map(|(a, b)| [a.clone(), b.clone()]));
+            moved_pairs.extend(done.iter().cloned());
             if !done.is_empty() {
                 undo = Some(Undo::Moved(done));
             }
@@ -269,7 +274,7 @@ fn run(op: Op, ev: &Sender<OpEvent>, cancel: &AtomicBool, ctx: &egui::Context) {
             }
         }
     }
-    let _ = ev.send(OpEvent::Finished { label, errors, touched, undo });
+    let _ = ev.send(OpEvent::Finished { label, errors, touched, undo, moved: moved_pairs });
 }
 
 /// Déplace ou renomme plusieurs chemins (source → destination) en deux temps : chaque source

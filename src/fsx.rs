@@ -116,6 +116,7 @@ pub fn list_dir(path: &Path) -> std::io::Result<Vec<Entry>> {
     Ok(out)
 }
 
+#[derive(Clone)]
 pub struct Drive {
     pub root: PathBuf,
     pub label: String,

@@ -146,19 +146,30 @@ pub(crate) fn decode(path: &Path, size: u32, disk: &socle::images::DiskCache) ->
 /// seulement une vraie miniature, sinon `None`.
 #[cfg(windows)]
 fn shell_thumb(path: &Path, size: u32) -> Option<ColorImage> {
+    shell_image(path, size, false)
+}
+
+/// Icône Windows d'un fichier ou d'un dossier (celle de l'Explorateur), `size` px.
+#[cfg(windows)]
+pub fn shell_icon(path: &Path, size: u32) -> Option<ColorImage> {
+    shell_image(path, size, true)
+}
+
+/// Image du Shell (IShellItemImageFactory) : miniature seule, ou icône seule.
+#[cfg(windows)]
+fn shell_image(path: &Path, size: u32, icon: bool) -> Option<ColorImage> {
     use windows::Win32::Foundation::SIZE;
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC,
     };
     use windows::Win32::UI::Shell::{
-        IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_THUMBNAILONLY,
+        IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY, SIIGBF_THUMBNAILONLY,
     };
     use windows::core::HSTRING;
     unsafe {
         let factory: IShellItemImageFactory = SHCreateItemFromParsingName(&HSTRING::from(path.as_os_str()), None).ok()?;
-        let hbmp = factory
-            .GetImage(SIZE { cx: size as i32, cy: size as i32 }, SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK)
-            .ok()?;
+        let flags = if icon { SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK } else { SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK };
+        let hbmp = factory.GetImage(SIZE { cx: size as i32, cy: size as i32 }, flags).ok()?;
         let mut bm = BITMAP::default();
         GetObjectW(hbmp.into(), std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut BITMAP as *mut _));
         let (w, h) = (bm.bmWidth, bm.bmHeight.abs());

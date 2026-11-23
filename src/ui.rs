@@ -51,6 +51,7 @@ impl App {
         }
         self.draw_drag_ghost(ui);
         self.draw_confirm(ui);
+        self.draw_name_prompt(ui);
         self.draw_palette_and_help(ui);
         self.draw_batch(ui);
         self.draw_goto(ui);
@@ -254,9 +255,15 @@ impl App {
                 ui.checkbox(&mut self.s.quick_viewer, "Espace : aperçu rapide dans le lecteur")
                     .on_hover_text("Sinon, Espace ouvre l’aperçu plein écran intégré. Si le lecteur ne répond pas, l’aperçu intégré prend le relais.");
             });
+            ui.horizontal(|ui| {
+                ui.label("Icônes des fichiers :");
+                ui.radio_value(&mut self.s.windows_icons, false, "de l’app");
+                ui.radio_value(&mut self.s.windows_icons, true, "Windows")
+                    .on_hover_text("Les icônes du système, par type de fichier (et par fichier pour les .exe, raccourcis et .ico). Chargées en arrière-plan.");
+            });
             if ui
                 .checkbox(&mut self.s.global_index, "Recherche dans tous les disques (Ctrl+P)")
-                .on_hover_text("Index de tous les noms de fichiers, reconstruit en arrière-plan. Environ 40 octets par fichier en mémoire.")
+                .on_hover_text("Index de tous les noms de fichiers, reconstruit en arrière-plan (environ 40 octets par fichier en mémoire). Donne aussi l’onglet « Récents ».")
                 .changed()
             {
                 self.index = if self.s.global_index { Some(crate::index::Index::start(&self.ctx)) } else { None };
@@ -317,11 +324,10 @@ impl App {
                 ui.close();
             }
             ui.separator();
-            let pinned = self.s.pinned.contains(&cur);
-            if ui.button(if pinned { "Retirer des épingles" } else { "Épingler ce dossier" }).clicked() {
-                self.actions.push(if pinned { Action::Unpin(cur.clone()) } else { Action::Pin(cur.clone()) });
-                ui.close();
-            }
+            let mut acts = Vec::new();
+            self.pin_menu(ui, &cur, &mut acts);
+            self.quick_menu(ui, &cur, &mut acts);
+            self.actions.extend(acts);
             ui.separator();
             ui.checkbox(&mut self.s.auto_update, "Chercher les mises à jour automatiquement");
             if ui
@@ -473,110 +479,6 @@ impl App {
     }
 
     // ---------- Barre latérale ----------
-    fn draw_sidebar(&mut self, ui: &mut Ui) {
-        let p = self.pal;
-        egui::Panel::left("side")
-            .resizable(true)
-            .default_size(220.0)
-            .min_size(170.0)
-            .frame(Frame::new().fill(p.side).inner_margin(Margin::symmetric(10, 14)))
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let cur = self.tab().path.clone();
-                    let section = |ui: &mut Ui, t: &str| {
-                        ui.add_space(6.0);
-                        ui.label(RichText::new(t.to_uppercase()).size(11.0).color(p.muted).strong());
-                        ui.add_space(2.0);
-                    };
-                    let item = |ui: &mut Ui, icon: Icon, name: &str, path: &PathBuf, actions: &mut Vec<Action>, pinned: bool| {
-                        let on = &cur == path;
-                        let (rect, r) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
-                        let hover_drop = r.dnd_hover_payload::<DragPaths>().is_some();
-                        let bg = if on {
-                            p.soft
-                        } else if hover_drop {
-                            p.sel_bg
-                        } else if r.hovered() {
-                            p.hover_bg
-                        } else {
-                            Color32::TRANSPARENT
-                        };
-                        ui.painter().rect_filled(rect, CornerRadius::same(7), bg);
-                        paint_icon(ui, pos2(rect.left() + 18.0, rect.center().y), 16.0, icon, p.accent);
-                        paint_text_left(ui, rect, rect.left() + 34.0, name, FontId::proportional(13.5), p.text, rect.width() - 40.0);
-                        if r.clicked() {
-                            actions.push(Action::Navigate(path.clone()));
-                        }
-                        if r.middle_clicked() {
-                            actions.push(Action::NewTab(path.clone()));
-                        }
-                        if let Some(d) = r.dnd_release_payload::<DragPaths>() {
-                            let copy = ui.input(|i| i.modifiers.ctrl);
-                            actions.push(Action::DropInto { paths: d.0.clone(), dst: path.clone(), copy });
-                        }
-                        let r = r.on_hover_text(path.display().to_string());
-                        r.context_menu(|ui| {
-                            if ui.button("Ouvrir dans un nouvel onglet").clicked() {
-                                actions.push(Action::NewTab(path.clone()));
-                                ui.close();
-                            }
-                            if ui.button("Ouvrir un terminal ici").clicked() {
-                                actions.push(Action::Terminal(path.clone()));
-                                ui.close();
-                            }
-                            if pinned && ui.button("Retirer des épingles").clicked() {
-                                actions.push(Action::Unpin(path.clone()));
-                                ui.close();
-                            }
-                            if !pinned && ui.button("Épingler").clicked() {
-                                actions.push(Action::Pin(path.clone()));
-                                ui.close();
-                            }
-                        });
-                    };
-                    let mut acts = Vec::new();
-                    if self.s.dev {
-                        if let Some(r) = &self.repo {
-                            section(ui, "Dépôt");
-                            let name = r.root.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                            item(ui, Icon::Git, &name, &r.root.clone(), &mut acts, false);
-                        }
-                    }
-                    section(ui, "Accès rapide");
-                    if self.s.global_index {
-                        item(ui, Icon::Clock, "Récents", &crate::recents::path(), &mut acts, false);
-                    }
-                    for (name, path) in self.quick.clone() {
-                        item(ui, Icon::Folder, &name, &path, &mut acts, false);
-                    }
-                    if !self.s.pinned.is_empty() {
-                        section(ui, "Épinglés");
-                        for path in self.s.pinned.clone() {
-                            let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-                            item(ui, Icon::Pin, &name, &path, &mut acts, true);
-                        }
-                    }
-                    section(ui, "Disques");
-                    for d in &self.drives {
-                        item(ui, Icon::Drive, &d.label, &d.root, &mut acts, false);
-                        let used = 1.0 - d.free as f32 / d.total.max(1) as f32;
-                        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 14.0), Sense::hover());
-                        let bar = Rect::from_min_size(pos2(rect.left() + 10.0, rect.top() + 1.0), vec2(rect.width() - 20.0, 4.0));
-                        ui.painter().rect_filled(bar, CornerRadius::same(2), p.soft);
-                        let mut fill = bar;
-                        fill.set_width(bar.width() * used);
-                        ui.painter().rect_filled(fill, CornerRadius::same(2), if used > 0.9 { p.del } else { p.accent });
-                        ui.label(
-                            RichText::new(format!("   {} libres sur {}", fsx::human_size(d.free), fsx::human_size(d.total)))
-                                .size(11.0)
-                                .color(p.muted),
-                        );
-                    }
-                    self.actions.extend(acts);
-                });
-            });
-    }
-
     // ---------- Barre d'état ----------
     fn draw_status(&mut self, ui: &mut Ui) {
         let p = self.pal;
@@ -837,10 +739,11 @@ impl App {
                     ui.painter().rect_filled(bar, CornerRadius::same(1), c.gamma_multiply(live_t.max(0.2)));
                 }
                 // icône + nom
-                let icon_color = if e.is_dir { p.accent } else { p.muted };
-                paint_icon(ui, pos2(rect.left() + 26.0, rect.center().y), 16.0, entry_icon(e), icon_color);
+                let tint = self.color_of(&e.path);
+                let icon_color = tint.unwrap_or(if e.is_dir { p.accent } else { p.muted });
+                self.paint_entry_icon(ui, pos2(rect.left() + 26.0, rect.center().y), 16.0, e, icon_color);
                 let name = if searching { e.display.clone().unwrap_or_else(|| e.name.clone()) } else { e.name.clone() };
-                let name_color = if e.hidden { p.muted } else { p.text };
+                let name_color = tint.unwrap_or(if e.hidden { p.muted } else { p.text });
                 if !renaming {
                     paint_text_left(ui, rect, rect.left() + 42.0, &name, FontId::proportional(13.5), name_color, name_w);
                 }
@@ -954,16 +857,21 @@ impl App {
                             play_badge(ui, thumb.center(), 18.0);
                         }
                     }
+                    let tint = self.color_of(&e.path);
                     if !drawn {
-                        let col = if e.is_dir { p.accent } else { p.muted };
-                        paint_icon(ui, thumb.center(), 44.0, entry_icon(&e), col);
+                        let col = tint.unwrap_or(if e.is_dir { p.accent } else { p.muted });
+                        self.paint_entry_icon(ui, thumb.center(), 44.0, &e, col);
+                    }
+                    if let (Some(c), true) = (tint, drawn) {
+                        // couleur sur une miniature : pastille dans le coin
+                        ui.painter().circle_filled(pos2(thumb.right() - 9.0, thumb.top() + 9.0), 5.0, c);
                     }
                     let name = if searching { e.display.clone().unwrap_or_else(|| e.name.clone()) } else { e.name.clone() };
                     let name_rect = Rect::from_min_size(pos2(rect.left() + 8.0, thumb.bottom() + 6.0), vec2(cell_w - 16.0, 20.0));
                     if renaming {
                         self.rename_box(ui, name_rect, &mut acts);
                     } else {
-                        paint_text_left(ui, name_rect, name_rect.left(), &name, FontId::proportional(13.0), p.text, name_rect.width());
+                        paint_text_left(ui, name_rect, name_rect.left(), &name, FontId::proportional(13.0), tint.unwrap_or(p.text), name_rect.width());
                     }
                     let meta = if e.is_dir { "Dossier".to_string() } else { fsx::human_size(e.size) };
                     let meta_rect = name_rect.translate(vec2(0.0, 19.0));
@@ -1045,6 +953,7 @@ impl App {
         if mods.shift {
             return;
         }
+        let p = self.pal;
         resp.context_menu(|ui| {
             ui.set_min_width(230.0);
             if ui.button("Ouvrir").clicked() {
@@ -1119,11 +1028,11 @@ impl App {
                 }
             }
             ui.separator();
-            if !multi && ui.button("Renommer   F2").clicked() {
+            if !multi && ui.button(RichText::new("Renommer   F2").color(p.accent)).clicked() {
                 acts.push(Action::StartRename(e.path.clone()));
                 ui.close();
             }
-            if multi && ui.button("Renommer en lot…   F2").clicked() {
+            if multi && ui.button(RichText::new("Renommer en lot…   F2").color(p.accent)).clicked() {
                 acts.push(Action::OpenBatchRename);
                 ui.close();
             }
@@ -1135,20 +1044,19 @@ impl App {
                 acts.push(Action::Unzip(e.path.clone()));
                 ui.close();
             }
-            if ui.button("Mettre à la corbeille   Suppr").clicked() {
+            if ui.button(RichText::new("Mettre à la corbeille   Suppr").color(p.del)).clicked() {
                 acts.push(Action::Trash);
                 ui.close();
             }
-            if ui.button("Supprimer définitivement   Maj+Suppr").clicked() {
+            if ui.button(RichText::new("Supprimer définitivement   Maj+Suppr").color(p.del).strong()).clicked() {
                 acts.push(Action::AskDelete);
                 ui.close();
             }
             ui.separator();
+            self.color_menu(ui, &targets, acts);
             if e.is_dir {
-                if ui.button("Épingler").clicked() {
-                    acts.push(Action::Pin(e.path.clone()));
-                    ui.close();
-                }
+                self.pin_menu(ui, &e.path, acts);
+                self.quick_menu(ui, &e.path, acts);
             }
             if ui.button("Afficher dans l’Explorateur Windows").clicked() {
                 acts.push(Action::Reveal(e.path.clone()));
@@ -1910,4 +1818,19 @@ fn diff_view(ui: &mut Ui, p: &socle::theme::Palette, lines: &[crate::git::DiffLi
             ui.painter().text(pos2(rect.left() + 72.0, rect.center().y), Align2::LEFT_CENTER, text, font.clone(), fg);
         }
     });
+}
+
+impl App {
+    /// Icône d'un élément : icône vectorielle de l'app (ou icône Windows, selon le réglage).
+    pub fn paint_entry_icon(&mut self, ui: &Ui, center: egui::Pos2, size: f32, e: &Entry, color: Color32) {
+        if self.s.windows_icons {
+            if let Some(tex) = self.sysicons.get(e) {
+                let side = size * 1.15;
+                let r = Rect::from_center_size(center, vec2(side, side));
+                ui.painter().image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                return;
+            }
+        }
+        paint_icon(ui, center, size, entry_icon(e), color);
+    }
 }

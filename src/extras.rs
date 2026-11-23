@@ -27,7 +27,8 @@ impl App {
                 let frec = (1.0 + *n as f32).ln() * 12.0 + 30.0 / (1.0 + age_days);
                 cands.insert(k.clone(), frec);
             }
-            for path in self.s.pinned.iter().chain(self.quick.iter().map(|q| &q.1)) {
+            let quick: Vec<PathBuf> = self.quick_items().into_iter().map(|q| q.path).filter(|p| !crate::recents::is_recents(p)).collect();
+            for path in self.s.pin_groups.iter().flat_map(|g| g.paths.iter()).chain(quick.iter()) {
                 cands.entry(path.to_string_lossy().into_owned()).or_insert(8.0);
             }
             for d in &self.drives {
