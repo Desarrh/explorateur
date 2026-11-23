@@ -1,8 +1,8 @@
 # Explorateur — stack technique (document de référence)
 
 Doc de référence du projet. La présentation publique (en anglais, avec les performances) est dans [README.md](README.md).
-Tout ce qui suit est relevé dans le code de `main` (version 0.3.2). Écarts doc/code vérifiés par EGM
-(`egm-drift-report`, rapports dans `egm/`, hors dépôt).
+Tout ce qui suit est relevé dans le code de `main` (version 0.3.2). Rapports de relecture (EGM) dans `egm/`,
+hors dépôt.
 
 ## 1. But et direction
 
@@ -11,28 +11,37 @@ Tout ce qui suit est relevé dans le code de `main` (version 0.3.2). Écarts doc
 - **Ce qu'il remplace** : l'Explorateur Windows au quotidien (il peut devenir l'explorateur par défaut :
   Win+E et dossiers ouverts depuis le Bureau ou d'autres applis). Le Bureau et la barre des tâches restent à Windows.
 - **Principes** :
-  - léger : rendu CPU sans contexte GPU (~40–45 Mo de RAM, exe unique de ~14 Mo) ;
+  - léger : rendu CPU sans contexte GPU (~40–45 Mo de RAM **sans** l'index global ; ~160 Mo juste après son
+    premier parcours, et il est activé par défaut ; exe unique de ~14 Mo) ;
   - jamais bloquer l'interface : lectures de dossiers, contenus de fichiers, réseau, git, décodages et calculs
     lourds tournent sur des threads ; le fil de l'interface ne fait que des vérifications ponctuelles d'un seul
     chemin (existe-t-il, est-ce un dossier) après une action ou un événement ;
   - pas de droits admin, pas d'installateur, réglages dans un simple fichier JSON ;
   - comportement Windows natif là où ça compte (presse-papiers, glisser-déposer, menu clic droit, miniatures).
 
+- **Hors périmètre** : le Bureau et la barre des tâches, les disques réseau comme cible principale (ils
+  marchent, sans index ni vérifications), macOS et Linux, la synchronisation cloud.
+- **Vocabulaire** : vue **Bureau** (navigation de tous les jours) et vue **Dev** (git, diff, commit, activité
+  en direct, passes) se choisissent en haut à droite ; « **recherche globale** » = le réglage `global_index`
+  (index de tous les noms de fichiers, actif par défaut, qui donne aussi l'onglet « Récents ») ; « **Pause** »
+  = bouton du flux d'activité de la vue Dev ; E1 / E2 / E3 / T3 = numéros des pistes dans `C:\Dev\QOL.md`
+  (E1 rafales d'agent, E2 récents partout, E3 carte de l'espace, T3 aperçu rapide par le lecteur).
+
 ## 2. Stack
 
 | Domaine | Choix |
 |---|---|
 | Langage | Rust, édition 2024 (`rust-version = "1.95"` dans Cargo.toml, toolchain MSVC). Testé avec rustc 1.99.1 |
-| UI | `egui` 0.37.0 (mode immédiat) |
-| Fenêtre / entrées | `winit` 0.30.13 + `egui-winit` 0.37.0 (features `clipboard`, `links`), boucle d'événements écrite à la main (pas d'eframe) |
-| Rendu | CPU : `hdrshot-egui-backend` 0.2.0 (rastériseur egui logiciel, cache par tuiles de 64 px, crate `egui_software_backend`) + `softbuffer` 0.4.8 (présentation GDI). Ordre des pixels `Bgra` |
+| UI | `egui` 0.37.0 (mode immédiat) — pourquoi : listes virtualisées et état simple à redessiner à chaque événement disque ; même base que les autres apps (thème et composants du socle) |
+| Fenêtre / entrées | `winit` 0.30.13 + `egui-winit` 0.37.0 (features `clipboard`, `links`), boucle d'événements écrite à la main (pas d'eframe : eframe impose un contexte GPU, et il faut garder la main sur le moment où l'on redessine pour rester à 0 % au repos) |
+| Rendu | CPU : `hdrshot-egui-backend` 0.2.0 (rastériseur egui logiciel, cache par tuiles de 64 px, crate `egui_software_backend`) + `softbuffer` 0.4.8 (présentation GDI). Ordre des pixels `Bgra`. Pourquoi : un contexte OpenGL/DirectX coûte ~150 Mo de mémoire pilote à lui seul. Repli si la crate tierce casse : la forker (petite, sans dépendance lourde), ou revenir à `egui_glow` en acceptant ~150 Mo de plus |
 | Fichiers | `notify` 8.2.2 (suivi live), `trash` 5.4.0 (corbeille + restauration), `open` 5.4.5, `zip` 9.7.3 (deflate), `ignore` 0.4.34 (parcours ripgrep, `.gitignore`), `rayon` 1.12.0, `memchr` 2.8.3 |
 | Socle commun | [`socle`](https://github.com/Desarrh/socle) v0.1.6 (tag git ; pour développer le socle en même temps, renommer `.cargo/config.toml.off` en `config.toml`, qui le remplace par `../socle` — fichier ignoré par git), features `ui images img-svg img-wic settings crash instance update testmode` : thème, icônes vectorielles, composants (champ avec autocomplétion, palette Ctrl+K, aide F1, contrôle segmenté), recherche floue, raccourcis (`keys`), miniatures + cache disque, réglages, journal de plantage, instance unique, mise à jour |
 | Images | décodeurs du socle (`socle::images` : png, jpeg, gif, webp, bmp, ico, tiff, qoi, tga, dds (BC1-3), hdr, psd/psb, svg, aperçus RAW, + tout ce que WIC sait lire : HEIC, AVIF…) ; pas d'EXR ni de JXL (features `img-exr` / `img-jxl` du socle non activées) ; `image` 0.25.10 reste pour l'icône de fenêtre et les tests |
 | Divers | `crossbeam-channel` 0.5.17, `serde`/`serde_json` 1, `chrono` 0.4.45, `dirs` 7.0.0, `regex` 1.13.2, `bytemuck` 1 |
 | API Windows | `windows-sys` 0.61.2 (FindFirstFileExW, GetDiskFreeSpaceExW, presse-papiers CF_HDROP, registre, ShellExecuteExW « properties », GetAsyncKeyState) et `windows` 0.62, comme le socle (IShellItemImageFactory pour les miniatures, IContextMenu/2/3 + SetWindowSubclass pour le menu natif, GDI) |
 | Build | `build.rs` + `winresource` 0.1.34 : icône `assets/icon.ico` et nom « Explorateur » intégrés à l'exe |
-| Outils externes (optionnels) | `git` (vue Dev), `curl.exe` (mises à jour, fourni avec Windows 10/11), Windows Terminal / PowerShell, VS Code (`code`), app Claude (lien `claude://code/new?folder=`), [lecteur universel](https://github.com/Desarrh/lecteur-universel) |
+| Outils externes (optionnels) | `git` (vue Dev ; la commande `git` plutôt que `gix` : même comportement que le git de l'utilisateur, hooks et configuration compris), `curl.exe` (mises à jour, fourni avec Windows 10/11), Windows Terminal / PowerShell, VS Code (`code`), app Claude (lien `claude://code/new?folder=`), [lecteur universel](https://github.com/Desarrh/lecteur-universel) |
 
 **Build release** : `cargo build --release` → `target\release\explorateur.exe`.
 Profil release : `lto = "thin"`, `codegen-units = 4`, `strip = true`. En dev, dépendances en `opt-level = 2`.
@@ -59,8 +68,8 @@ Profil release : `lto = "thin"`, `codegen-units = 4`, `strip = true`. En dev, d�
 | `src/places.rs` | Barre latérale : accès rapide personnalisable, groupes d'épingles repliables, couleurs de fichiers et dossiers (et leur suivi lors des renommages / déplacements) |
 | `src/sysicons.rs` | Icônes Windows (réglage « Icônes des fichiers ») : lues par le Shell sur un thread, cache par extension (par fichier pour `.exe` `.lnk` `.ico` `.url` `.msc`) |
 | `src/winx.rs` | Presse-papiers de fichiers, glisser vers l'extérieur (`SHDoDragDrop`), menu Windows natif, explorateur par défaut (registre HKCU), Claude Code, ouvrir avec, terminal |
-| `src/viewer.rs` | Lien avec le lecteur universel (ouvrir, aperçu rapide par tube, `--convert`) |
-| `src/tests.rs` | Tests unitaires (`cargo test --release`) + 3 benchmarks ignorés (`bench_affichage` : 10 000 fichiers sans fenêtre) |
+| `src/viewer.rs` | Lien avec le lecteur universel (ouvrir, aperçu via `--apercu`, `--formats`, `--convert`) |
+| `src/tests.rs` | Tests unitaires (`cargo test --release`) + 3 benchmarks et 4 captures sans fenêtre, ignorés par défaut (`bench_affichage` : 10 000 fichiers) |
 
 **Flux de données** : à chaque image, `App::tick()` vide les canaux (chargements de dossiers, événements
 `notify`, résultats git, opérations, miniatures, tailles, index, mises à jour, dossiers reçus d'une 2ᵉ instance),
@@ -73,7 +82,8 @@ le dessin du double volet.
 Les événements disque sont regroupés par image et appliqués en place à la liste (pas de rechargement).
 
 **Threads** : boucle UI (principal : pas de lecture de dossier ni de contenu de fichier ; seulement des
-vérifications ponctuelles d'un chemin — événements, actions, Ctrl+P sur les 40 résultats d'une frappe, aperçu du
+vérifications ponctuelles d'un chemin, sur les disques fixes locaux seulement — événements, actions, Ctrl+P
+(dossiers de l'historique : un chemin réseau ou amovible n'est pas vérifié), les 40 résultats d'une frappe, aperçu du
 renommage en lot quand un champ change, sonde de conteneur au réglage « explorateur par défaut ») ; 1 icônes
 Windows (si le réglage est actif) ; 1 thread par chargement de dossier ; 2–4
 miniatures ; 1 file d'opérations ; 1 git (+ 1 thread par push) ; 1 pool rayon (4–16) pour les tailles ; 1 index ;
@@ -196,7 +206,8 @@ ménage au lancement).
 **Style de code** : commentaires et textes d'UI en français ; modules courts par domaine ; état
 centralisé dans `App` ; actions différées ; pas d'`unwrap` sur les E/S (erreurs → toast rouge dans la barre
 d'état) ; `unsafe` limité aux appels Win32 de `winx.rs`, `fsx.rs`, `index.rs`, `thumbs.rs`, `ops.rs` (espace
-libre), `viewer.rs` (ressource de version) et `app.rs` (vidage du presse-papiers).
+libre), `viewer.rs` (ressource de version), `sysicons.rs` (COM) et `app.rs` (vidage du presse-papiers) : Win32 et COM
+seulement ; `grep unsafe src` fait foi.
 Panique → `crash.log` avec pile d'appels, signalé au lancement suivant.
 
 **Lancement / installation / mise à jour** : exe portable (zip de release à décompresser), aucun
@@ -232,7 +243,7 @@ Un test ne surveille jamais les vrais disques ni l'instance de l'utilisateur.
 **Git** : auteur `Desarrh <175427122+Desarrh@users.noreply.github.com>`, pas de mention de Claude dans
 les commits. Dépôt public `Desarrh/explorateur`.
 
-## 6. Fonctionnalités (fonctionnent aujourd'hui)
+## 6. Fonctionnalités (codées et testées ; celles pas encore vérifiées à l'écran sont listées au § 8)
 
 - Onglets, historique, fil d'Ariane cliquable ou éditable, accès rapide, épingles, disques avec espace libre.
 - Liste triable (tri naturel) ou grille de miniatures ; aperçu (image, image de vidéo, texte/code, méta).
@@ -293,6 +304,9 @@ les commits. Dépôt public `Desarrh/explorateur`.
 
 ## 7. Intégrations
 
+Les noms des apps et l'état de chaque intégration font foi dans `C:\Dev\DIRECTION.md` § 5 ; ci-dessous, seulement
+ce qui concerne l'explorateur.
+
 - **Lecteur universel** (existante) : Espace → `--apercu <fichier>` (aperçu rapide, repli sur l'aperçu intégré,
   réglage `quick_viewer`) ; double-clic / Entrée sur image, PDF, Word, audio, vidéo, code →
   `lecteur-universel.exe` (cherché à côté de l'explorateur, dans `C:\Dev\lecteur-universel\dist\` ou
@@ -338,7 +352,8 @@ les commits. Dépôt public `Desarrh/explorateur`.
 - Pas de tests d'interface automatiques (tests unitaires + captures sans fenêtre à regarder).
 - Rafales d'agent : seulement dans un dépôt git, **en vue Dev** (c'est là que le dépôt est surveillé en entier et
   que l'instantané de base est pris), et pas pendant « Pause » ; les instantanés écrivent des objets git non
-  référencés dans `.git/objects` (jusqu'à 5 000 fichiers / 256 Mo pour la base ; nettoyés par `git gc`) ; fichiers > 64 Mo ni copiés ni
+  référencés dans `.git/objects` (jusqu'à 5 000 fichiers / 256 Mo pour la base ; retirés par `git gc --prune=now`, sinon par `git gc` au bout de
+  2 semaines) ; fichiers > 64 Mo ni copiés ni
   restaurés ; une passe ouverte avant le premier instantané du dépôt n'a pas de diff.
 - Récents : sans la recherche globale, pas de récents ; dates de l'index rafraîchies toutes les 6 h, le
   direct ne voit que ce qui change depuis le lancement ; un dépassement du tampon de ReadDirectoryChangesW
@@ -348,71 +363,63 @@ les commits. Dépôt public `Desarrh/explorateur`.
 - Glisser vers l'extérieur (`SHDoDragDrop`) : objet de données testé, geste réel pas encore vérifié à la souris.
 - Événements disque ignorés par `.gitignore` : la taille des dossiers parents n'est pas invalidée (choix :
   pas d'accès disque pour les builds) ; elle se met à jour au prochain calcul.
+- Mise à jour : l'empreinte SHA-256 prouve que le fichier est arrivé intact, pas qui l'a publié (elle vient de la
+  même API GitHub que le fichier). La signature ed25519 des releases reste à faire (socle).
+- Couleurs : liées au chemin. Un renommage ou un déplacement fait par un autre programme les perd (elles restent
+  enregistrées sans servir) ; une suppression définitive faite par l'explorateur les retire, la corbeille les garde
+  (on peut restaurer).
 
-## 9. Pistes QoL (à valider ; faites : 2, 4, 5 sauf EXR/JXL, 6, 9)
+## 9. Pistes QoL (à valider)
 
-Deux types, marqués : **[Inédit]** (n'existe nulle part à notre connaissance) et **[Existe ailleurs]**
-(classique ailleurs, absent ici). Règle absolue : **tout doit être instantané**. Pour chaque piste,
+Deux types, marqués : **[Inédit]** (absent de l'Explorateur Windows, de Files, de Directory Opus, de Total
+Commander et de OneCommander, à notre connaissance) et **[Existe ailleurs]** (classique ailleurs, absent ici).
+Règle absolue : **tout doit être instantané** (seuils de `C:\Dev\DIRECTION.md` § 2.1 : réponse en moins d'une image,
+recherche en moins de 5 ms). Pour chaque piste,
 « ⚡ » dit comment elle le reste. Effort : S (≤ 1 jour), M (quelques jours), L (une à deux semaines).
-Classées par utilité pour l'utilisateur (dev avec Claude, jeu, YouTube).
+Classées par utilité pour l'utilisateur (dev avec Claude, jeu, YouTube). **Déjà faites** (voir § 6) : 2 rafales
+d'agent, 4 autocomplétion, 5 miniatures de presque tous les formats (sauf EXR / JXL), 6 récents partout, 9 carte
+de l'espace. Les pistes 1, 8 et l'historique des passes devront partager **un seul** magasin d'instantanés.
 
 1. **[Inédit] Rembobiner un dossier** (M) — dev. Un curseur de temps dans la vue Dev : « ce dossier il y a
    10 min ». Chaque fichier texte modifié par un agent est restauré au clic, même hors git ou sans commit.
-   ⚡ À chaque événement `notify` déjà reçu, on copie l'ancienne version des fichiers texte de moins de 1 Mo
-   dans un magasin dédupliqué par hash (thread dédié, écriture différée) ; le curseur ne fait que lire un
-   petit journal en mémoire ; rien n'est relu tant qu'on ne restaure pas.
-2. ✅ **[Inédit] Rafales d'agent** (S) — dev. Le flux d'activité regroupe automatiquement les changements
-   en « passes » (« 12 fichiers modifiés entre 14:32 et 14:34 ») avec, pour chaque passe : voir le diff
-   cumulé, tout restaurer, ouvrir Claude Code dessus. ⚡ Simple regroupement des événements déjà en mémoire
-   par silence de plus de 20 s ; diff calculé à la demande sur la passe affichée seulement.
+   ⚡ Un événement `notify` arrive **après** l'écriture : l'ancienne version est déjà perdue. Donc, quand le
+   dossier s'ouvre en vue Dev, on copie d'abord une base des fichiers texte de moins de 1 Mo (5 000 fichiers /
+   256 Mo au plus, thread dédié), puis chaque nouvelle version à chaque événement, dans un magasin dédupliqué par
+   hash ; taille du magasin bornée (les versions les plus anciennes partent) ; le curseur ne lit qu'un petit
+   journal en mémoire.
 3. **[Inédit] Glisser vers Claude** (S) — dev. Une zone « Claude » dans la barre latérale : y déposer des
    fichiers ouvre une session Claude Code sur le dossier avec un brouillon de demande qui les cite
-   (`claude://code/new?folder=…&q=…`, paramètre `q` reconnu par l'app). ⚡ Aucun calcul : on construit un
-   lien et on le passe à Windows.
-4. ✅ **[Existe ailleurs] Autocomplétion de la barre d'adresse et du filtre** (S) — tous. Taper `C:\De` propose
-   `C:\Dev\` ; Tab complète ; dans le filtre, suggestions issues des noms du dossier et des recherches passées.
-   ⚡ Sous-dossiers lus via le cache de dossiers déjà chargés ou un `read_dir` en tâche de fond
-   (annulé à chaque frappe) ; dossiers fréquents tirés de `visits` (déjà en mémoire) ; tri par fréquence,
-   jamais d'E/S sur le fil de l'interface.
-5. ✅ (sauf EXR / JXL) **[Existe ailleurs] Miniatures de presque tous les formats d'image** (M) — YouTube / jeu. En plus de
-   png/jpg/webp/gif/bmp/ico et de ce que Windows sait faire : TGA, DDS (textures de jeu), EXR/HDR, QOI,
-   PSD, SVG, AVIF, HEIC, JXL et l'aperçu JPEG intégré des photos RAW. ⚡ Décodeurs Rust dans le pool de
-   miniatures existant (2–4 threads), seulement pour les cellules visibles ; cache disque des miniatures
-   (clé = chemin + date + taille) pour qu'un dossier déjà vu s'affiche immédiatement au prochain passage ;
-   pour le RAW on lit l'aperçu embarqué au lieu de développer l'image.
-6. ✅ **[Existe ailleurs] Récents partout** (S) — YouTube / dev. Une vue « modifiés récemment, tous disques »
-   (exports vidéo, captures OBS, téléchargements). ⚡ Tirée de l'index global (ajouter la date au nœud :
-   +4 octets) et du flux `notify` ; tri partiel : 300 fichiers montrés (`recents::LIMIT`), 3 000 gardés en direct.
+   (`claude://code/new?folder=…&q=…` — paramètre `q` **à vérifier** ; repli : la demande va dans le presse-papiers
+   avec un toast ; lien limité à 2 000 caractères). ⚡ Aucun calcul : on construit un lien et on le passe à Windows.
 7. **[Inédit] Arrivées apprises** (M) — YouTube / jeu. Quand un fichier arrive dans Téléchargements ou dans
    le dossier d'OBS, l'explorateur propose en une touche la destination où tu ranges d'habitude ce type
-   (« .mp4 → Vidéos\PsychoNight_Shorts », « .zip de mod → dossier du jeu »), appris de tes déplacements.
+   (« .mp4 → Vidéos\Shorts », « .zip de mod → dossier du jeu »), appris de tes déplacements.
    ⚡ Table en mémoire (extension + motif de nom → dossier, avec compteurs) mise à jour à chaque
    déplacement ; la suggestion est une simple recherche dans cette table.
 8. **[Inédit] Avant / après d'une image** (S) — dev de jeu. Quand un sprite ou une texture est réécrit
    (par toi ou un agent), le volet d'aperçu affiche un curseur avant/après pendant quelques minutes.
    ⚡ On garde la miniature précédente au lieu de la jeter quand le fichier change (déjà en cache) ; aucun
    décodage en plus.
-9. ✅ **[Existe ailleurs] Carte de l'espace disque** (M) — jeu. Treemap façon WizTree pour voir ce qui remplit
-   `J:\SteamLibrary` et nettoyer. ⚡ Construite à partir des tailles déjà calculées et mises en cache
-   (`sizes.rs`) ; arbre lu sur un thread, seulement à la profondeur affichée ; disposition (squarify, quelques
-   milliers de rectangles au plus) recalculée dans le fil de l'interface quand la zone change.
 10. **[Inédit] Carte de chaleur de tes fichiers** (S) — tous. Une teinte discrète sur les lignes selon la
     fréquence à laquelle tu ouvres ou modifies chaque fichier ; un tri « ce qui compte pour moi ».
-    ⚡ Compteurs par fichier ajoutés dans le même mécanisme que `visits` ; lecture O(1) au dessin.
+    ⚡ Compteurs par fichier dans un fichier à part (pas dans les réglages), bornés (les moins utilisés
+    partent) ; lecture O(1) au dessin.
 11. **[Existe ailleurs] Aperçu vidéo animé et écoute au survol** (M) — YouTube. Survol d'une vidéo : quelques
     images défilent ; survol d'un son : les premières secondes jouent. ⚡ Seulement après 300 ms d'arrêt du
-    pointeur, images extraites par Media Foundation sur un thread (comme le lecteur), résolution de
-    vignette, mises en cache ; annulé dès que le pointeur bouge.
-12. **[Existe ailleurs] Parcourir un zip comme un dossier** (M) — jeu (mods) / dev. Entrer dans un `.zip`
+    pointeur ; images et son demandés à l'instance d'aperçu du lecteur (`--apercu`), jamais Media Foundation
+    dans l'explorateur (un codec qui plante ne doit pas le faire tomber) ; annulé dès que le pointeur bouge.
+12. **[Existe ailleurs] Parcourir un zip comme un dossier** (M en lecture seule, L complet) — jeu (mods) / dev. Entrer dans un `.zip`
     (et `.7z`/`.rar` via 7-Zip s'il est installé), prévisualiser, extraire seulement ce qu'on glisse.
-    ⚡ On lit uniquement le répertoire central du zip (quelques Ko), jamais l'archive entière ; extraction
-    à la demande dans la file d'opérations.
+    Version M : liste en lecture seule + « extraire la sélection ». ⚡ On lit uniquement le répertoire central
+    du zip (quelques Ko), sur un thread ; extraction à la demande dans la file d'opérations.
 13. **[Inédit] Projets vivants** (S) — dev. Dans la barre latérale, tes dépôts avec leur branche, le nombre de
     changements et un point orange si un agent y écrit en ce moment ; un clic : Claude Code, VS Code ou
-    terminal. ⚡ Statut git rafraîchi seulement quand le watcher signale un changement (déjà en place),
-    avec un délai de 300 ms et au plus un `git status` par dépôt à la fois.
-14. **[Existe ailleurs] Index global en direct** (L) — tous. Petit service admin qui lit le journal NTFS (USN)
-    comme Everything : Ctrl+P toujours à jour, scan initial en quelques secondes. ⚡ L'app ne reçoit que les
-    différences par un canal ; l'index en mémoire est modifié sur place, sans reconstruction.
+    terminal. ⚡ Événements de la surveillance des disques (`recents::Live`, déjà en place) regroupés par racine
+    de dépôt ; statut git rafraîchi avec un délai de 300 ms et au plus un `git status` par dépôt à la fois.
+14. **[Existe ailleurs] Index global en direct** (M) — tous. Ctrl+P toujours à jour : les événements de la
+    surveillance des disques (`recents::Live`, déjà en place) modifient l'index en mémoire sur place, sans
+    reconstruction. Un service admin qui lit le journal NTFS (USN) comme Everything serait plus rapide au
+    premier parcours, mais il va contre `DIRECTION.md` (pas d'admin par défaut, pas de service imposé) : seulement
+    en option, si l'utilisateur le demande.
 15. **[Existe ailleurs] Étagère** (S) — tous. Un panier où déposer des fichiers pris dans plusieurs dossiers,
     puis tout déposer d'un coup ailleurs (ou dans Discord). ⚡ Ce n'est qu'une liste de chemins en mémoire.

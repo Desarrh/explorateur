@@ -117,7 +117,8 @@ impl App {
     /// Entrées de l'accès rapide : la liste personnalisée, sinon celles par défaut.
     pub fn quick_items(&self) -> Vec<QuickItem> {
         if let Some(q) = &self.s.quick_custom {
-            return q.clone();
+            // « Récents » n'existe qu'avec la recherche globale.
+            return q.iter().filter(|it| self.s.global_index || !crate::recents::is_recents(&it.path)).cloned().collect();
         }
         let mut v = Vec::new();
         if self.s.global_index {

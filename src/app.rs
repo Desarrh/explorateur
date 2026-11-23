@@ -2485,7 +2485,15 @@ impl App {
 
     pub fn confirm_yes(&mut self) {
         match self.confirm.take() {
-            Some(Confirm::Delete(paths)) => self.ops.submit(Op::Delete(paths)),
+            Some(Confirm::Delete(paths)) => {
+                // Supprimés pour de bon : leurs couleurs aussi (la corbeille, elle, les garde).
+                for p in &paths {
+                    let k = crate::places::color_key(p);
+                    let inside = format!("{k}\\");
+                    self.s.colors.retain(|c, _| c != &k && !c.starts_with(&inside));
+                }
+                self.ops.submit(Op::Delete(paths));
+            }
             Some(Confirm::Restore { rel, untracked }) => {
                 if let Some(r) = &self.repo {
                     self.git.send(git::Req::Restore { root: r.root.clone(), rel, untracked });

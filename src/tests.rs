@@ -169,15 +169,15 @@ fn conversion_par_le_lecteur() {
 #[test]
 fn index_recherche_et_sauvegarde() {
     let d = tmpdir("index");
-    std::fs::create_dir_all(d.join("Projets").join("PsychoNight")).unwrap();
-    std::fs::write(d.join("Projets").join("PsychoNight").join("rapport_final.docx"), b"x").unwrap();
+    std::fs::create_dir_all(d.join("Projets").join("MonProjet")).unwrap();
+    std::fs::write(d.join("Projets").join("MonProjet").join("rapport_final.docx"), b"x").unwrap();
     std::fs::write(d.join("Projets").join("notes.txt"), b"x").unwrap();
     std::fs::write(d.join("final-cut.mp4"), b"x").unwrap();
     let ix = crate::index::scan_dir_for_test(&d);
     // insensible à la casse, sous-chaîne, chemin complet reconstruit
-    let hits = ix.search("PSYCHO", 10);
+    let hits = ix.search("MONPROJ", 10);
     assert_eq!(hits.len(), 1);
-    assert_eq!(crate::index::real_case(&hits[0].path), d.join("Projets").join("PsychoNight"));
+    assert_eq!(crate::index::real_case(&hits[0].path), d.join("Projets").join("MonProjet"));
     assert!(hits[0].is_dir);
     let hits = ix.search("final", 10);
     let names: Vec<&str> = hits.iter().map(|h| h.name.as_str()).collect();
@@ -198,7 +198,7 @@ fn index_recherche_et_sauvegarde() {
 fn bench_index() {
     let (d, t) = crate::index::full_scan_for_test();
     println!("index de tous les disques fixes : {} éléments en {t:?}", d.len());
-    for q in ["psycho", "readme", "zz", ".rs"] {
+    for q in ["readme", "zz", ".rs"] {
         let t0 = std::time::Instant::now();
         let hits = d.search(q, 40);
         println!("  recherche « {q} » : {} résultats en {:?} (ex. {:?})", hits.len(), t0.elapsed(), hits.first().map(|h| h.path.display().to_string()));

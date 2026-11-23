@@ -52,7 +52,19 @@ impl App {
                 })
                 .collect();
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            let folders: Vec<String> = scored.into_iter().map(|x| x.1).filter(|p| Path::new(p).is_dir()).take(if q.len() >= 2 { 6 } else { 12 }).collect();
+            // Vérifié sur le disque seulement pour les disques fixes locaux : un chemin réseau ou
+            // amovible pourrait bloquer l'interface plusieurs secondes (il est gardé tel quel).
+            let fixed: Vec<String> = self.drives.iter().filter(|d| d.fixed).map(|d| d.root.to_string_lossy().to_lowercase()).collect();
+            let on_fixed = |p: &str| {
+                let l = p.to_lowercase();
+                fixed.iter().any(|r| l.starts_with(r.as_str()))
+            };
+            let folders: Vec<String> = scored
+                .into_iter()
+                .map(|x| x.1)
+                .filter(|p| if on_fixed(p) { Path::new(p).is_dir() } else { !p.starts_with(r"\\") })
+                .take(if q.len() >= 2 { 6 } else { 12 })
+                .collect();
             let g = self.goto.as_mut().unwrap();
             g.folders = folders;
             g.folders_q = Some(q.clone());

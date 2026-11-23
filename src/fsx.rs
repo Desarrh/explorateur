@@ -119,6 +119,8 @@ pub fn list_dir(path: &Path) -> std::io::Result<Vec<Entry>> {
 #[derive(Clone)]
 pub struct Drive {
     pub root: PathBuf,
+    /// Disque fixe local (pas réseau, ni amovible, ni lecteur optique).
+    pub fixed: bool,
     pub label: String,
     pub total: u64,
     pub free: u64,
@@ -126,7 +128,7 @@ pub struct Drive {
 
 #[cfg(windows)]
 pub fn drives() -> Vec<Drive> {
-    use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetLogicalDrives};
+    use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives};
     let mask = unsafe { GetLogicalDrives() };
     let mut v = Vec::new();
     for i in 0..26u32 {
@@ -141,7 +143,8 @@ pub fn drives() -> Vec<Drive> {
         if ok == 0 {
             continue;
         }
-        v.push(Drive { root: PathBuf::from(&root), label: format!("{letter}:"), total, free });
+        let fixed = unsafe { GetDriveTypeW(wide.as_ptr()) } == 3; // DRIVE_FIXED
+        v.push(Drive { root: PathBuf::from(&root), fixed, label: format!("{letter}:"), total, free });
     }
     v
 }
